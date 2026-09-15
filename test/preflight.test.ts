@@ -58,6 +58,14 @@ test("Path A rejects a non-monthly / non-USD / scoped budget", async () => {
   expect(r.messages.join("\n")).toMatch(/COST|MONTHLY|scoped/i);
 });
 
+test("Path A rejects a non-USD budget (currency branch, independent of type/period/scoped)", async () => {
+  const r = await runPreflight(cfg({ existingBudgetName: "B" }), deps({
+    describeBudget: async () => ({ BudgetType: "COST", TimeUnit: "MONTHLY", unit: "EUR", scoped: false })
+  }));
+  expect(r.ok).toBe(false);
+  expect(r.messages.join("\n")).toMatch(/USD/);
+});
+
 test("warns caller is not covered", async () => {
   const r = await runPreflight(cfg(), deps({
     getCallerIdentity: async () => ({ Account: "111122223333", Arn: "arn:aws:iam::111122223333:user/someoneelse" })
@@ -138,6 +146,31 @@ test("rejects a cross-account full-ARN target", async () => {
   );
   expect(r.ok).toBe(false);
   expect(r.messages.join("\n")).toMatch(/account/i);
+});
+
+test("rejects a full-ARN target whose real resolved ARN differs from the one supplied (typo'd path)", async () => {
+  const raw = "arn:aws:iam::111122223333:user/wrongpath/student";
+  const r = await runPreflight(
+    cfg({ denyTargetUsers: [raw] }),
+    deps({
+      getUser: async () => ({ arn: "arn:aws:iam::111122223333:user/college/student", path: "/college/" })
+    })
+  );
+  expect(r.ok).toBe(false);
+  const text = r.messages.join("\n");
+  expect(text).toMatch(/does not match the resolved identity/i);
+  expect(text).toMatch(/\.env/i);
+});
+
+test("rejects a full-ARN target placed in the wrong config array (role ARN under denyTargetUsers)", async () => {
+  const r = await runPreflight(
+    cfg({ denyTargetUsers: ["arn:aws:iam::111122223333:role/Admin"] }),
+    deps()
+  );
+  expect(r.ok).toBe(false);
+  const text = r.messages.join("\n");
+  expect(text).toMatch(/configured as a user/i);
+  expect(text).toMatch(/names a role/i);
 });
 
 // --- Augmentation 4: recovery-route permission check (best effort, qualified) ---

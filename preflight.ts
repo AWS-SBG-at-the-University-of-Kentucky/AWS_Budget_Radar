@@ -84,7 +84,27 @@ export async function runPreflight(config: RadarConfig, deps: PreflightDeps): Pr
     if (badForm) { fail(`Deny target "${raw}" (${kind}) ${badForm}.`); continue; }
 
     const isBareName = !raw.startsWith("arn:");
-    const bareName = isBareName ? raw : (parseIamArn(raw)?.name ?? raw);
+    let bareName: string;
+    if (isBareName) {
+      bareName = raw;
+    } else {
+      // badTargetForm() above already rejected any full ARN that doesn't
+      // parse as an IAM identity ARN, so this is non-null here.
+      const parsedRaw = parseIamArn(raw)!;
+      bareName = parsedRaw.name;
+
+      // Fix (type/array consistency): the resource type embedded in the ARN
+      // must match the config array (denyTargetUsers/Groups/Roles) the value
+      // was placed in — that array, not the ARN string, is what the stack's
+      // denyTargetArns() and the budgets action definition key off of.
+      if (parsedRaw.kind !== kind) {
+        fail(
+          `Target "${raw}" is configured as a ${kind} (in IAM_DENY_TARGET_${kind.toUpperCase()}S), ` +
+          `but the ARN itself names a ${parsedRaw.kind}. Move it to the matching IAM_DENY_TARGET_* list.`
+        );
+        continue;
+      }
+    }
 
     // Reserved SSO roles are AWS-protected and cannot usefully be targeted.
     if (kind === "role" && bareName.includes("AWSReservedSSO_")) {
@@ -99,6 +119,21 @@ export async function runPreflight(config: RadarConfig, deps: PreflightDeps): Pr
 
     if (!entity) {
       fail(`${kind[0].toUpperCase()}${kind.slice(1)} target "${raw}" could not be resolved in IAM.`);
+      continue;
+    }
+
+    // Fix (silently-non-attaching guard): for a full ARN, the stack uses the
+    // RAW literal ARN verbatim as the Deny policy Resource (see
+    // lib/budget-radar-stack.ts denyTargetArns()) — it never re-resolves it.
+    // If the raw ARN's path/name doesn't match the real, resolved identity
+    // (e.g. a typo'd path), the stack would attach the deny to an ARN that
+    // doesn't exist, silently leaving the real identity unprotected.
+    if (!isBareName && entity.arn !== raw) {
+      fail(
+        `Target "${raw}" does not match the resolved identity ${entity.arn}; ` +
+        `the deny would attach to the ARN you typed (not the real one) and silently fail to protect anyone. ` +
+        `Fix the ARN in .env.`
+      );
       continue;
     }
 
