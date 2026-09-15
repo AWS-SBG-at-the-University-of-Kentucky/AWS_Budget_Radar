@@ -1,0 +1,29 @@
+{
+  "name": "aws-budget-radar",
+  "version": "0.1.0",
+  "bin": { "budget-radar": "bin/budget-radar.js" },
+  "scripts": {
+    "build": "tsc",
+    "test": "jest",
+    "synth": "cdk synth",
+    "preflight": "ts-node preflight.ts",
+    "deploy": "ts-node preflight.ts && cdk deploy"
+  },
+  "devDependencies": {
+    "@types/jest": "^29.5.12",
+    "@types/node": "^20.14.0",
+    "aws-cdk": "^2.160.0",
+    "jest": "^29.7.0",
+    "ts-jest": "^29.2.0",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.5.0"
+  },
+  "dependencies": {
+    "aws-cdk-lib": "^2.160.0",
+    "constructs": "^10.3.0",
+    "dotenv": "^16.4.5",
+    "@aws-sdk/client-sts": "^3.600.0",
+    "@aws-sdk/client-iam": "^3.600.0",
+    "@aws-sdk/client-budgets": "^3.600.0"
+  }
+}
