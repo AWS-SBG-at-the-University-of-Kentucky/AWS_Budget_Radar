@@ -29,10 +29,15 @@ report.
 
 1. Clone, edit one `.env`, run `cdk deploy`. No console clicking.
 2. Work whether or not a budget already exists (§2 paths below).
-3. On breach: block new spend by the configured identities; email a complete,
-   honest inventory including a "still costing you money" section.
-4. Touch no running resource. Nothing to restore, nothing to break.
-5. Safe to leave unattended: the block self-clears each budget period.
+3. On breach: block **selected resource-creation operations** by the configured
+   identities; email a **best-effort inventory with explicit coverage gaps**,
+   including a "still costing you money" section.
+4. Touch no running resource — no workload or IAM mutations (publishing the
+   report and writing logs aside). Nothing to restore. Note it is not "nothing to
+   break": denying creation can still stop a *targeted* identity's workload from
+   replacing failed capacity or scaling out (§5.7).
+5. Safe to leave unattended: the block clears on the native budget-period reset
+   (expected behavior), and a documented admin route can reverse it sooner.
 6. Fit typical free-tier usage; state the small costs that can still apply.
 
 ### Deployment paths
@@ -81,11 +86,14 @@ backstop, not a cap; the README says so plainly.
 > "if no remediation action is taken, the restrictive IAM policy will be
 > automatically detached at the start of the next budget period." — *AWS Cloud Ops Blog*
 
-Two consequences: (a) v1 sends **one report per threshold per period** — there is
-no re-notify loop, so no scheduler is built; a scheduled re-check is future work
-(§13). FORECASTED thresholds can re-alert within a period and give earlier
-warning (they need ~5 weeks of history). (b) The applied deny **auto-detaches at
-the next period**, so the tool never permanently blocks the member.
+Two consequences: (a) an ACTUAL threshold typically notifies once per period, but
+duplicate deliveries and additional status notifications are possible, so v1
+**builds no re-notify loop and relies on no exact delivery count**; the read-only
+handler is safe to run repeatedly (a scheduled re-check is future work, §13).
+FORECASTED thresholds can re-alert within a period and give earlier warning (they
+need ~5 weeks of history). (b) The applied deny detaches on the **native
+period-reset** (expected behavior, not a guarantee), and an admin route (§10) can
+reverse it sooner — so the member is not left permanently blocked.
 
 ### 5.3 A BudgetsAction is the trigger and requires an IAM definition + targets
 
@@ -104,8 +112,10 @@ paths; a non-existent name fails at deploy — a free typo-guard.
 > free." — then $0.10/day. Adding an action to an already-action-enabled budget
 > does not consume another slot. — *AWS Budgets pricing / FAQs*
 
-One action-enabled budget → free. In Path A, our action consumes one of the
-member's two free action slots (noted for anyone already using them).
+One action-enabled budget → free within the account's available allowances. In
+Path A, if the member's existing budget is **already** action-enabled, adding our
+action does not consume another slot; if it is not, our action makes it the
+member's first or second action-enabled budget (free) — beyond two, $0.10/day.
 
 ### 5.5 The SNS facts that actually bite
 
@@ -135,9 +145,8 @@ and cannot establish a remote budget's semantics, so Path A requires an
 **authenticated read-only preflight** (§7.7) that calls `DescribeBudget` with
 `ShowFilterExpression=true` and **rejects** an unsupported type, non-monthly
 period, non-USD unit, inactive/expired dates, or an invalid limit. A **scoped**
-budget (any `FilterExpression`/`CostFilters`) is rejected in v1 unless the member
-explicitly opts in and acknowledges which spend is excluded — a scoped budget is
-never described as protecting total account cost. The preflight reads
+budget (any `FilterExpression`/`CostFilters`) is **rejected in v1** — a scoped
+budget does not protect total account cost, and supporting it safely is deferred. The preflight reads
 `FilterExpression`/`Metrics`, not only the deprecated `CostFilters`/`CostTypes`,
 and flags representations it cannot interpret rather than guessing. It never
 rewrites the member's budget, and it does not treat a budget's config-update
@@ -170,7 +179,7 @@ itself):
         v
    AWS::Budgets::BudgetsAction  (APPLY_IAM_POLICY; targets REQUIRED)
         |                                   \
-        |  Definition attaches deny  ────────► blocks NEW spend by configured IDs
+        |  Definition attaches deny  ────────► blocks selected create ops by configured IDs
         |  Subscribers → TriggerTopic
         v
    TriggerTopic ──► Report Lambda (READ-ONLY inventory) ──► ReportTopic ──► email
@@ -184,6 +193,11 @@ itself):
 - **ReportTopic**: the Lambda and any warn-only thresholds publish here; only
   email subscribes. The Lambda never subscribes to it → no recursion.
 
+**Deployment is one guarded command.** `npm run deploy` runs the §7.7 preflight
+with the member's current credentials and `.env`, and invokes `cdk deploy` **only
+if the preflight passes**. `cdk bootstrap` (once per account/region) and the SNS
+email confirmation (§5.5) are the two out-of-band steps the README calls out.
+
 ## 7. Components
 
 ### 7.1 Repository layout
@@ -195,7 +209,8 @@ lib/deny-policy.ts            the Deny policy document, isolated for review
 lib/config.ts                 .env parsing and validation
 lambda/handler.py             read-only inventory reporter (boto3 only, no deps)
 .env.example                  the only file a member edits
-preflight.ts                  read-only pre-deploy checks (§7.7); run before cdk deploy
+preflight.ts                  read-only pre-deploy checks (§7.7)
+package.json → "deploy"       npm run deploy = preflight && cdk deploy (§6)
 test/budget-radar.test.ts     CDK assertions (jest)
 tests/test_handler.py         handler logic (pytest, stubbed boto3)
 package.json  tsconfig.json  cdk.json  .gitignore
@@ -213,7 +228,8 @@ tool changes no resource.
 | `SNS::TopicPolicy` ×2 | Allow `budgets.amazonaws.com` publish, confused-deputy conditions |
 | `SNS::Subscription` (email) | On ReportTopic; needs confirmation (§5.5) |
 | `SNS::Subscription` (lambda) | On TriggerTopic; auto-confirmed |
-| `Lambda::Function` | Python 3.13, 512 MB, 300 s, `Code.fromAsset('lambda/')`, no deps |
+| `Lambda::Function` | Python 3.13, 512 MB, **900 s**, `Code.fromAsset('lambda/')`, no deps |
+| `SQS::Queue` (or on-failure dest) | Non-recursive failure destination for exhausted async retries (§7.4 req) |
 | `Logs::LogGroup` | Explicit, short retention (e.g. 30 d) to bound log cost |
 | `IAM::Role` (Lambda) | Read-only describe/list across services + publish to ReportTopic |
 | `IAM::ManagedPolicy` | The Deny policy. Created unattached; the action attaches it |
@@ -258,7 +274,10 @@ action's `Fn::GetAtt ActionId`) are passed as env vars.
 4. **Inventory** running EC2 (+ ASG membership noted), RDS/Aurora, ECS
    services/tasks, Lambda functions (reserved vs provisioned concurrency),
    SageMaker notebooks/endpoints, plus **"still costing you money"**: EBS, NAT
-   gateways, unattached EIPs, load balancers, S3 by size class, and a catch-all.
+   gateways, unattached EIPs, load balancers, **S3 sizes from daily CloudWatch
+   `BucketSizeBytes` metrics per bucket and storage type (with the metric
+   timestamp; missing data = unknown — never enumerate objects)**, and a
+   catch-all.
    Each service/region is marked **complete / empty / failed / unsupported /
    not-scanned-before-deadline**. **A denied or failed read is reported as such —
    never rendered as zero resources** (false comfort is the worst outcome).
@@ -266,7 +285,12 @@ action's `Fn::GetAtt ActionId`) are passed as env vars.
    message at 262,144 bytes). If the report would exceed it, send a concise
    summary with explicitly disclosed omissions and where to see the rest
    (CloudWatch Logs / console), or split into numbered bounded messages —
-   **never** silently truncate into a claim of completeness.
+   **never** silently truncate into a claim of completeness. **Inventory errors
+   yield a partial report; a failure of the final publish itself fails the
+   invocation so Lambda's async retries re-attempt, and exhausted retries go to a
+   configured non-recursive failure destination** (SNS invokes Lambda
+   asynchronously). This prevents the deny activating while the member silently
+   receives nothing.
 
 The report **header** carries: budget, threshold (as %/USD), account, covered
 identities; observed action status + timestamp; scan start/end and per-area
@@ -276,7 +300,8 @@ Budgets reports successful execution," not a claim that every principal's
 effective permissions were proven. Inspecting actual policy attachments on the
 targets is a stronger, separate check (future work).
 
-The handler makes **no mutating call**, so there is no dry-run to gate.
+The handler makes **no workload or IAM mutation** — only report publishing and
+logging — so there is no dry-run to gate.
 
 ### 7.5 Configuration
 
@@ -298,20 +323,35 @@ ACTION_THRESHOLD_TYPE=ACTUAL    # or FORECASTED for earlier / repeatable alerts 
 
 SAFETY=watch                    # watch = deny waits for console approval; armed = deny auto-applies
 
-# REQUIRED (§5.3): identities the deny attaches to. Root is never covered (§5.7).
+# REQUIRED (§5.3): identities the deny attaches to, as names or full ARNs. Root
+# is never covered (§5.7). synth consumes these values directly — no live lookup;
+# the §7.7 preflight validates them against IAM before deploy.
 IAM_DENY_TARGET_USERS=
 IAM_DENY_TARGET_GROUPS=
 IAM_DENY_TARGET_ROLES=
+
+# REQUIRED: a principal that can reverse the action / detach the deny (the admin
+# recovery route, §10). The preflight confirms it actually holds those perms.
+RECOVERY_PRINCIPAL_ARN=
 
 # Optional warn-only per-service cost budgets. Exact AWS service names.
 SERVICE_BUDGETS=
 ```
 
+Identity values flow to synthesis **as written in `.env`** — CDK synth performs no
+live IAM lookup, so it stays credential-free and reproducible; the preflight is
+what resolves and validates them against live IAM (§7.7). A **scoped** existing
+budget is **rejected in v1** (§5.6), so there is no scoped-budget opt-in flag to
+configure.
+
 **Validation (fails synth with an actionable message):** valid email; **at least
 one IAM deny target** (§5.3); Path B `MONTHLY_BUDGET_USD` > 0 and `WARN_AT_PERCENT`
 1–99; `ACTION_THRESHOLD_PERCENT` 1–100; `FORECASTED` warns it is meaningless on a
-zero-spend budget and needs history; `SAFETY ∈ {watch, armed}`; the Lambda's own
-execution role and the action role are **not** among the deny targets. These are *syntactic* checks; the remote identity and budget checks run in the §7.7 preflight, which must pass before deploy.
+zero-spend budget and needs history; `SAFETY ∈ {watch, armed}`; `RECOVERY_PRINCIPAL_ARN` is present and is **not**
+itself a deny target; the Lambda's own execution role and the action role are
+**not** among the deny targets. These are *syntactic* checks; the remote identity,
+recovery-principal, and budget checks run in the §7.7 preflight, which must pass
+before deploy.
 
 ### 7.6 `SAFETY`
 
@@ -377,24 +417,26 @@ with explicit gaps so the inventory is never mistaken for a full bill assessment
    scope, so ASG termination, self-throttle, and lost data cannot occur.
 3. **Positive-list deny** (§7.3) with a self-lockout test; never restrains itself,
    IAM, budgets, or read access.
-4. **Deny auto-detaches next period** (§5.2) — never a permanent block.
+4. **Deny detaches on the native period-reset** (§5.2, expected behavior) and an
+   admin route (§10) can reverse it sooner — the member is not permanently blocked.
 5. **Identity-scoped, honestly framed** (§5.7).
 
 ## 10. Teardown
 
-`npx cdk destroy` removes the watchdog and the deny policy resource. But a managed
-policy cannot be deleted while attached, and CloudFormation (via the API) does not
-auto-detach. So **if the deny is currently applied, first reverse the budget
-action in the console (or wait for the period reset, when it self-detaches), then
-`cdk destroy`.** No resource restart is ever required to uninstall, because
-nothing was stopped. (Whether deleting the action detaches the policy cleanly is a
-live-test item.)
+`npx cdk destroy` removes the watchdog and the deny policy resource. A managed
+policy cannot be deleted while it is still attached, so **if the deny is currently
+applied, first reverse the budget action (admin route / console) or wait for the
+period-reset, verify the policy is detached, then `cdk destroy`.** No resource
+restart is ever required to uninstall, because nothing was stopped. Whether
+`cdk destroy` alone detaches and deletes cleanly is **established by the live
+teardown test** (§11), not asserted here.
 
 ## 11. Testing / acceptance
 
 - **`tests/test_handler.py`** (pytest, stubbed boto3) — full-inventory regardless
   of message body; per-region/service failure is caught and still reports;
-  pagination; **no mutating call is ever made**; publishes only to ReportTopic.
+  pagination; **no workload or IAM mutation is ever made** (only publish + logs);
+  publishes only to ReportTopic; a publish failure fails the invocation.
 - **`test/budget-radar.test.ts`** (jest + CDK assertions) — two distinct topics
   with correct publisher/subscriber wiring; both topic policies carry
   confused-deputy conditions; Path A creates the action but no budget, Path B
