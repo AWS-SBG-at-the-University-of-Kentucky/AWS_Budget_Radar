@@ -78,9 +78,12 @@ export class BudgetRadarStack extends cdk.Stack {
     this.reporter.addToRolePolicy(new iam.PolicyStatement({
       actions: [
         "ec2:DescribeRegions", "ec2:DescribeInstances", "ec2:DescribeAddresses",
+        "ec2:DescribeVolumes", "ec2:DescribeNatGateways",
         "rds:DescribeDBInstances", "rds:DescribeDBClusters",
         "ecs:ListClusters", "ecs:ListServices", "ecs:DescribeServices",
+        "ecs:ListTasks", "ecs:DescribeTasks",
         "lambda:ListFunctions", "lambda:GetFunctionConcurrency",
+        "lambda:ListProvisionedConcurrencyConfigs",
         "sagemaker:ListNotebookInstances", "sagemaker:ListEndpoints",
         "cloudwatch:GetMetricData",
         "elasticloadbalancing:DescribeLoadBalancers",
