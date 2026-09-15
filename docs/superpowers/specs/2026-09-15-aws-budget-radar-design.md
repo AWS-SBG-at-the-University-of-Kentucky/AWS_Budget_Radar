@@ -364,12 +364,18 @@ definition — the Lambda half still works.
 Rationale: stopping *your own* running resources is reversible and low-regret, so
 `confirm` automates it; the broader deny is the bigger hammer, so it asks first.
 
-> **Implementation note to verify:** whether a `MANUAL` action notifies its SNS
-> subscribers at *trigger* time (pending approval) or only at *execution* time
-> (after approval). This determines whether, in Path A + `confirm`, the Lambda
-> fires before or after the member approves the deny. If it only fires
-> post-approval, `confirm` in Path A degrades toward `watch`. Verify before
-> building `confirm`; `watch` and `armed` are unaffected.
+**Resolved (does not depend on path):** a `MANUAL` action notifies its SNS
+subscribers at *trigger* time, in the `pending` state — not only after approval:
+
+> "You receive a notification to inform you that an action is pending or has
+> already run on your behalf, regardless of your action preferences."
+> — *Reviewing and approving your budget action*
+
+So in `confirm`, the Lambda fires immediately (stops running resources) while the
+deny waits for console approval, and this works in **both** paths through the
+action's own subscriber — no separate trigger. The action may notify a second
+time when it later executes post-approval; the Lambda's idempotency (§7.4)
+absorbs the duplicate.
 
 ## 8. Safety
 
