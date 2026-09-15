@@ -13,7 +13,7 @@ days because nobody was watching.
 ## 2. What Budget Radar is (and is not)
 
 Budget Radar is a **low-cost safeguard for personal learning accounts.** When a
-cost budget is breached, it **restricts new spend-causing operations by the IAM
+cost budget is breached, it **restricts selected creation and start operations by the IAM
 identities you configure** and **emails you a region-wide inventory of what is
 running and what is still costing money**, so you can investigate and shut things
 down yourself.
@@ -23,7 +23,11 @@ charges can exceed the threshold before the alert arrives and continue after.
 Unsupported services, storage, networking, commitments, and identities outside
 the configured set can keep incurring charges. Budget Radar **never stops,
 scales, or deletes any resource** — remediation is the member's, informed by the
-report.
+report. Because the deny includes `ec2:StartInstances` and `rds:StartDBInstance`,
+a **targeted identity cannot restart its own stopped EC2/RDS instances while the
+block is active** (until the period reset, or a recovery-principal reversal). This
+is intended; the README states it plainly, and recovery→restart is an explicit
+acceptance test (§11).
 
 ## 3. Goals
 
