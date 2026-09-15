@@ -334,7 +334,16 @@ def handler(event, context):
 
     status, status_ts = observe_action_status(account_id, budget_name, action_id)
     deadline = time.time() + 780  # leave headroom under the 900s Lambda timeout for the report publish
-    inv = inventory(enabled_regions(), deadline_epoch=deadline)
+    try:
+        regions = enabled_regions()
+        region_failure_area = None
+    except Exception as e:  # never abort reporting just because region discovery failed
+        regions = []
+        region_failure_area = {"region": "(all)", "service": "region-enumeration",
+                                "state": FAILED, "items": [], "error": str(e)}
+    inv = inventory(regions, deadline_epoch=deadline)
+    if region_failure_area is not None:
+        inv["areas"].insert(0, region_failure_area)
     body = build_report(status, status_ts, inv, safety)
     publish(report_topic, "AWS Budget Radar: budget threshold reached", body)  # raises on failure
     return {"status": "reported", "action_status": status}

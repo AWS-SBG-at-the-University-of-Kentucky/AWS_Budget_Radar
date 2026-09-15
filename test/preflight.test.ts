@@ -66,6 +66,33 @@ test("Path A rejects a non-USD budget (currency branch, independent of type/peri
   expect(r.messages.join("\n")).toMatch(/USD/);
 });
 
+test("Path A rejects a budget whose time period has already expired", async () => {
+  const r = await runPreflight(cfg({ existingBudgetName: "B" }), deps({
+    describeBudget: async () => ({
+      BudgetType: "COST", TimeUnit: "MONTHLY", unit: "USD", scoped: false, expired: true
+    })
+  }));
+  expect(r.ok).toBe(false);
+  expect(r.messages.join("\n")).toMatch(/expired|inactive/i);
+});
+
+test("Path A rejects a budget with a non-positive limit amount", async () => {
+  const r = await runPreflight(cfg({ existingBudgetName: "B" }), deps({
+    describeBudget: async () => ({
+      BudgetType: "COST", TimeUnit: "MONTHLY", unit: "USD", scoped: false, amount: 0
+    })
+  }));
+  expect(r.ok).toBe(false);
+  expect(r.messages.join("\n")).toMatch(/limit.*positive/i);
+});
+
+test("Path A accepts a budget when expired/amount fields are omitted (backward-compatible)", async () => {
+  const r = await runPreflight(cfg({ existingBudgetName: "B" }), deps({
+    describeBudget: async () => ({ BudgetType: "COST", TimeUnit: "MONTHLY", unit: "USD", scoped: false })
+  }));
+  expect(r.ok).toBe(true);
+});
+
 test("warns caller is not covered", async () => {
   const r = await runPreflight(cfg(), deps({
     getCallerIdentity: async () => ({ Account: "111122223333", Arn: "arn:aws:iam::111122223333:user/someoneelse" })

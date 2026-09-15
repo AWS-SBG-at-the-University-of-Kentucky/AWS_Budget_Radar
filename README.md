@@ -84,10 +84,15 @@ npm run deploy
 ```
 
 This runs the read-only `preflight.ts` check first (resolves your configured
-identities, confirms your own credentials' coverage, validates any existing
-budget, checks the recovery principal, rejects unsupported targets like
-`AWSReservedSSO_*` roles) and only calls `cdk deploy` if it passes. If the
-preflight fails, fix `.env` (or your IAM setup) and re-run.
+identities, checks whether your own credentials are covered (and warns if
+not), validates any existing budget, checks the recovery principal, rejects
+unsupported targets like `AWSReservedSSO_*` roles) and only calls
+`cdk deploy` if it passes. If the preflight fails, fix `.env` (or your IAM
+setup) and re-run.
+
+The preflight also reports whether the CDK bootstrap / CloudFormation
+execution roles are covered, uncovered, or unknown — since deploy-time
+actions run under those roles rather than your own credentials.
 
 **After deploy, check your email and click the SNS subscription confirmation
 link.** Until you confirm, the email endpoint receives nothing — this is an

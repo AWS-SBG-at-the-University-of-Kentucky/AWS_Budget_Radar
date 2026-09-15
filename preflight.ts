@@ -13,7 +13,12 @@ export interface PreflightDeps {
   // users in one call — that single shape resolves a group target's ARN
   // (path-aware) and lets us check caller/recovery coverage via membership.
   getGroup(name: string): Promise<IamGroupInfo | null>;
-  describeBudget(name: string): Promise<{ BudgetType?: string; TimeUnit?: string; unit?: string; scoped: boolean } | null>;
+  describeBudget(name: string): Promise<{
+    BudgetType?: string; TimeUnit?: string; unit?: string; scoped: boolean;
+    // Optional (backward-compatible) fields for stricter Path A validation:
+    // whether the budget's time period has already ended, and its limit amount.
+    expired?: boolean; amount?: number;
+  } | null>;
   // Optional, best-effort. When supplied, its results are reported as
   // simulated/qualified — never treated as proof the recovery principal can
   // actually reverse the deny (real evaluation also depends on SCPs, other
@@ -243,6 +248,10 @@ export async function runPreflight(config: RadarConfig, deps: PreflightDeps): Pr
       if (b.TimeUnit !== "MONTHLY") fail(`Budget must be MONTHLY; got ${b.TimeUnit}.`);
       if (b.unit !== "USD") fail(`Budget must be USD; got ${b.unit}.`);
       if (b.scoped) fail("Scoped budgets are rejected in v1 (a scoped budget does not protect total account cost).");
+      if (b.expired) fail("Budget's time period has already ended (inactive/expired); it will not track ongoing spend.");
+      if (typeof b.amount === "number" && b.amount <= 0) {
+        fail(`Budget limit must be a positive amount; got ${b.amount}.`);
+      }
     }
   }
 
@@ -301,7 +310,10 @@ if (require.main === module) {
           } as any));
           const b = r.Budget as any;
           const scoped = !!(b?.FilterExpression || (b?.CostFilters && Object.keys(b.CostFilters).length));
-          return { BudgetType: b?.BudgetType, TimeUnit: b?.TimeUnit, unit: b?.BudgetLimit?.Unit, scoped };
+          const end = b?.TimePeriod?.End;
+          const expired = end ? new Date(end).getTime() < Date.now() : false;
+          const amount = b?.BudgetLimit?.Amount !== undefined ? Number(b.BudgetLimit.Amount) : undefined;
+          return { BudgetType: b?.BudgetType, TimeUnit: b?.TimeUnit, unit: b?.BudgetLimit?.Unit, scoped, expired, amount };
         } catch { return null; }
       },
       simulateRecoveryPermissions: async (principalArn, actions) => {

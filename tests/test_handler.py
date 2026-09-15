@@ -415,3 +415,120 @@ def test_s3_sizes_unknown_when_no_metric(monkeypatch):
     monkeypatch.setattr(handler, "_client", fake_client)
     lines = handler.s3_bucket_sizes()
     assert any("unknown" in l.lower() for l in lines)
+
+
+# --- Fix item 2: enabled_regions() failure must not abort reporting (spec 7.4) ---
+
+def test_handler_reports_even_when_enabled_regions_raises(monkeypatch):
+    monkeypatch.setenv("TRIGGER_TOPIC_ARN", "arn:aws:sns:us-east-1:111122223333:Trigger")
+    monkeypatch.setenv("ACCOUNT_ID", "111122223333")
+    monkeypatch.setenv("BUDGET_NAME", "b")
+    monkeypatch.setenv("ACTION_ID", "11111111-1111-1111-1111-111111111111")
+    monkeypatch.setenv("REPORT_TOPIC_ARN", "arn:aws:sns:us-east-1:111122223333:Report")
+
+    published = {}
+
+    def boom_enabled_regions():
+        raise RuntimeError("region enumeration denied")
+
+    def fake_observe_action_status(account_id, budget_name, action_id):
+        return "EXECUTION_SUCCESS", "2024-01-01T00:00:00+00:00"
+
+    def fake_publish(topic_arn, subject, body):
+        published["called"] = True
+        published["body"] = body
+
+    monkeypatch.setattr(handler, "enabled_regions", boom_enabled_regions)
+    monkeypatch.setattr(handler, "observe_action_status", fake_observe_action_status)
+    monkeypatch.setattr(handler, "s3_bucket_sizes", lambda: [])
+    monkeypatch.setattr(handler, "publish", fake_publish)
+
+    event = {"Records": [{"Sns": {"TopicArn": "arn:aws:sns:us-east-1:111122223333:Trigger", "Message": "x"}}]}
+    result = handler.handler(event, None)
+
+    assert result["status"] == "reported"
+    assert published.get("called") is True
+    body = published["body"]
+    assert "region-enumeration" in body.lower()
+    assert "region enumeration denied" in body.lower()
+
+
+# --- Fix item 1: no-mutation guard on the triggered path (spec 11) ---
+
+_MUTATING_VERBS = (
+    "create", "put", "delete", "attach", "detach", "update",
+    "start", "stop", "run", "terminate", "modify", "scale",
+)
+
+
+def _is_mutating(method_name: str) -> bool:
+    name = method_name.lower()
+    return any(name.startswith(verb) for verb in _MUTATING_VERBS)
+
+
+class _RecordingClient:
+    """A fake boto3 client that records every method name invoked on it and
+    returns empty-but-well-shaped responses for the calls the handler needs."""
+
+    def __init__(self, calls, service):
+        self._calls = calls
+        self._service = service
+
+    def _record(self, name):
+        self._calls.append(f"{self._service}.{name}")
+
+    def get_paginator(self, op_name):
+        self._record(op_name)
+
+        class _Pager:
+            def paginate(self, **kw):
+                return iter([])
+        return _Pager()
+
+    def __getattr__(self, name):
+        self._record(name)
+
+        def _call(*args, **kwargs):
+            if name == "describe_budget_action":
+                return {"Action": {"Status": "EXECUTION_SUCCESS"}}
+            if name == "list_buckets":
+                return {"Buckets": []}
+            if name == "describe_regions":
+                return {"Regions": [{"RegionName": "us-east-1"}]}
+            if name == "describe_addresses":
+                return {"Addresses": []}
+            if name == "publish":
+                return {"MessageId": "fake"}
+            return {}
+        return _call
+
+
+def test_triggered_path_makes_no_mutation_only_reads_and_publish(monkeypatch):
+    monkeypatch.setenv("TRIGGER_TOPIC_ARN", "arn:aws:sns:us-east-1:111122223333:Trigger")
+    monkeypatch.setenv("ACCOUNT_ID", "111122223333")
+    monkeypatch.setenv("BUDGET_NAME", "b")
+    monkeypatch.setenv("ACTION_ID", "11111111-1111-1111-1111-111111111111")
+    monkeypatch.setenv("REPORT_TOPIC_ARN", "arn:aws:sns:us-east-1:111122223333:Report")
+
+    calls = []
+
+    def fake_client(service, region=None):
+        return _RecordingClient(calls, service)
+
+    monkeypatch.setattr(handler, "_client", fake_client)
+    # Every adapter returns [] via the recording client's empty paginators;
+    # exercise the real inventory()/build_report()/publish() code paths.
+    monkeypatch.setattr(handler, "enabled_regions", lambda: ["us-east-1"])
+
+    event = {"Records": [{"Sns": {"TopicArn": "arn:aws:sns:us-east-1:111122223333:Trigger", "Message": "x"}}]}
+    result = handler.handler(event, None)
+
+    assert result["status"] == "reported"
+    assert len(calls) > 0  # actually exercised the client
+
+    mutating = [c for c in calls if _is_mutating(c.split(".", 1)[1])]
+    assert mutating == [], f"Unexpected mutating call(s) on the triggered path: {mutating}"
+
+    # sns.publish is the one allowed "verb-like" call (starts with none of the
+    # mutating verbs) and must actually have happened.
+    assert any(c == "sns.publish" for c in calls)

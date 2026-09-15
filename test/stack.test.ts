@@ -111,7 +111,11 @@ test("action role attach/detach statement is scoped to the DenyNewSpend policy A
     PolicyDocument: Match.objectLike({
       Statement: Match.arrayWith([
         Match.objectLike({
-          Action: Match.arrayWith(["iam:AttachUserPolicy", "iam:DetachUserPolicy"]),
+          Action: Match.arrayWith([
+            "iam:AttachUserPolicy", "iam:DetachUserPolicy",
+            "iam:AttachGroupPolicy", "iam:DetachGroupPolicy",
+            "iam:AttachRolePolicy", "iam:DetachRolePolicy"
+          ]),
           Condition: Match.objectLike({
             ArnEquals: Match.objectLike({
               "iam:PolicyARN": Match.objectLike({ Ref: Match.stringLikeRegexp("DenyNewSpend") })
