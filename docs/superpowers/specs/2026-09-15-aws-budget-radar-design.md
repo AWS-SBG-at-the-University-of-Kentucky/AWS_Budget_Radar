@@ -123,17 +123,28 @@ From *"Creating an Amazon SNS topic for budget notifications"* and *SNS docs*:
   added KMS key grant. v1 leaves topics unencrypted as a simplicity choice (cost
   alerts, not secrets); a comment records the reason.
 
-### 5.6 Validate the budget's semantics, not just its existence
+### 5.6 Validate the budget's semantics remotely, and reject what v1 cannot support
 
-> Budgets have a `BudgetType`, `TimeUnit`, `BudgetLimit` (amount + unit), and
-> `CostTypes`; usage/RI/SP and service-filtered budgets do not protect total
-> account cost. — *`Budget` / `CostTypes` API reference*
+> `CostFilters` is **deprecated** ("Please consider using the new
+> `FilterExpression` field"); `DescribeBudget` accepts `ShowFilterExpression=true`
+> and returns `FilterExpression`/`Metrics` alongside the legacy fields. — *Budgets API*
 
-v1 supports **monthly USD COST** budgets. Path A validates the referenced budget
-is a cost budget and warns if it is filtered/usage/non-USD; it never rewrites the
-member's budget. Path B creates a monthly USD cost budget. **Credits and refunds**
-are included by default and can hide gross usage behind a small net threshold;
-the deployment summary records the chosen `CostTypes` treatment.
+v1 supports **only monthly USD COST budgets**, and this is enforced, not merely
+warned (rev-1 text contradicted itself here). Local `.env` checks are syntactic
+and cannot establish a remote budget's semantics, so Path A requires an
+**authenticated read-only preflight** (§7.7) that calls `DescribeBudget` with
+`ShowFilterExpression=true` and **rejects** an unsupported type, non-monthly
+period, non-USD unit, inactive/expired dates, or an invalid limit. A **scoped**
+budget (any `FilterExpression`/`CostFilters`) is rejected in v1 unless the member
+explicitly opts in and acknowledges which spend is excluded — a scoped budget is
+never described as protecting total account cost. The preflight reads
+`FilterExpression`/`Metrics`, not only the deprecated `CostFilters`/`CostTypes`,
+and flags representations it cannot interpret rather than guessing. It never
+rewrites the member's budget, and it does not treat a budget's config-update
+timestamp as billing freshness. **Credits/refunds** are included by default and
+can hide gross usage behind a small net threshold; the deploy summary records the
+chosen cost-metric treatment. SDK/CDK dependency versions are pinned to ones that
+expose these fields.
 
 ### 5.7 The IAM deny is identity-scoped, and CloudFormation can bypass it
 
@@ -142,7 +153,9 @@ roles, AWS service roles, and — if configured — the CloudFormation service r
 run under their own permissions and are unaffected; the root user ignores it
 entirely. So it is accident-prevention, not a boundary. The deploy summary reports
 exactly which identities are covered; the README recommends a dedicated learning
-identity and keeping recovery/admin access separate.
+identity and keeping recovery/admin access separate. The §7.7 preflight makes the
+actual coverage of the member's own credentials (and the CDK deploy roles) visible
+before deploy, rather than trusting a nonempty target list.
 
 ## 6. Architecture
 
@@ -182,6 +195,7 @@ lib/deny-policy.ts            the Deny policy document, isolated for review
 lib/config.ts                 .env parsing and validation
 lambda/handler.py             read-only inventory reporter (boto3 only, no deps)
 .env.example                  the only file a member edits
+preflight.ts                  read-only pre-deploy checks (§7.7); run before cdk deploy
 test/budget-radar.test.ts     CDK assertions (jest)
 tests/test_handler.py         handler logic (pytest, stubbed boto3)
 package.json  tsconfig.json  cdk.json  .gitignore
@@ -224,22 +238,45 @@ A test asserts the synthesized policy does not deny `iam:DetachUserPolicy`.
 
 ### 7.4 The Lambda (read-only reporter)
 
-1. **Validate** the event arrived via TriggerTopic; otherwise log and exit. It
-   does **not** parse the message body — it always reports the full inventory.
-2. **Enumerate enabled regions** (`DescribeRegions`), paginating every list call.
-3. **Inventory**, resiliently (per-region/service failures are caught and
-   reported, never fatal): running EC2 (+ ASG membership noted), RDS/Aurora,
-   ECS services/tasks, Lambda functions with reserved/provisioned concurrency,
-   SageMaker notebooks/endpoints, plus a **"still costing you money"** section:
-   EBS volumes, NAT gateways, unattached EIPs, load balancers, S3 buckets by
-   size class, and a catch-all "other services with spend — investigate."
-4. **Email** via ReportTopic: what is running, per region, each line labeled
-   **detected / unsupported / potential ongoing charge**, with a header stating
-   the deny is now applied (or pending approval in `watch`), how to lift it, and
-   that this inventory is not a guarantee that all spend was found.
+Runtime: Python 3.13, **900 s** timeout (the 15-minute max) to reduce timeouts,
+with bounded SDK connect/read timeouts and retry counts so a slow region cannot
+consume the whole budget. Account id, budget name, and the action id (from the
+action's `Fn::GetAtt ActionId`) are passed as env vars.
 
-The handler makes **no mutating call**, so there is no dry-run to gate and no
-resource-safety ordering to get wrong.
+1. **Validate** the event arrived via TriggerTopic; otherwise log and exit. It
+   does **not** parse the message body — inventory scope is fixed, never derived
+   from prose.
+2. **Observe action status** — call `DescribeBudgetAction(account, budget,
+   actionId)` and record the *observed* status (e.g. `EXECUTION_SUCCESS`,
+   `EXECUTION_FAILURE`, `REVERSE_SUCCESS`) and observation time. The report states
+   what AWS observed, **not** the configured mode — a delayed notification may
+   arrive after the action changed state, and `MANUAL` may still be pending. If
+   the lookup fails, status is **unknown** and the inventory is still sent.
+3. **Enumerate enabled regions** (`DescribeRegions`), paginating every list call,
+   with bounded parallelism and an overall **scan deadline** that reserves a
+   margin for publishing.
+4. **Inventory** running EC2 (+ ASG membership noted), RDS/Aurora, ECS
+   services/tasks, Lambda functions (reserved vs provisioned concurrency),
+   SageMaker notebooks/endpoints, plus **"still costing you money"**: EBS, NAT
+   gateways, unattached EIPs, load balancers, S3 by size class, and a catch-all.
+   Each service/region is marked **complete / empty / failed / unsupported /
+   not-scanned-before-deadline**. **A denied or failed read is reported as such —
+   never rendered as zero resources** (false comfort is the worst outcome).
+5. **Publish** to ReportTopic within a **UTF-8 byte budget** (SNS `Publish` caps a
+   message at 262,144 bytes). If the report would exceed it, send a concise
+   summary with explicitly disclosed omissions and where to see the rest
+   (CloudWatch Logs / console), or split into numbered bounded messages —
+   **never** silently truncate into a claim of completeness.
+
+The report **header** carries: budget, threshold (as %/USD), account, covered
+identities; observed action status + timestamp; scan start/end and per-area
+coverage result; a link/command to view or reverse the action; and the standing
+reminder that **workloads keep running until the member acts.** Wording is "AWS
+Budgets reports successful execution," not a claim that every principal's
+effective permissions were proven. Inspecting actual policy attachments on the
+targets is a stronger, separate check (future work).
+
+The handler makes **no mutating call**, so there is no dry-run to gate.
 
 ### 7.5 Configuration
 
@@ -274,7 +311,7 @@ SERVICE_BUDGETS=
 one IAM deny target** (§5.3); Path B `MONTHLY_BUDGET_USD` > 0 and `WARN_AT_PERCENT`
 1–99; `ACTION_THRESHOLD_PERCENT` 1–100; `FORECASTED` warns it is meaningless on a
 zero-spend budget and needs history; `SAFETY ∈ {watch, armed}`; the Lambda's own
-execution role and the action role are **not** among the deny targets.
+execution role and the action role are **not** among the deny targets. These are *syntactic* checks; the remote identity and budget checks run in the §7.7 preflight, which must pass before deploy.
 
 ### 7.6 `SAFETY`
 
@@ -285,7 +322,38 @@ execution role and the action role are **not** among the deny targets.
 
 A `MANUAL` action notifies subscribers at *pending* time (verified: *"a
 notification to inform you that an action is pending … regardless of your action
-preferences"*), so the report is sent in both modes.
+preferences"*), so the report is sent in both modes. The report states the
+**observed** action status at report time (§7.4 step 2), not this configured
+mode — the two can differ if a human has already approved, reversed, or the
+action failed.
+
+### 7.7 Deploy-time preflight (read-only)
+
+A configured target list does not prove the member's *actual* credentials are
+covered, and CDK deploys through bootstrap and CloudFormation execution roles the
+deny will not touch. So a **read-only preflight** — a script the member runs
+before `cdk deploy` (documented, credential-using; synth itself stays
+credential-free) — must pass first. It:
+
+1. Prints the current account and caller identity (`sts:GetCallerIdentity`).
+2. Resolves every configured user/group/role to a real IAM identity and full ARN
+   (including role paths), distinguishing a role name from an STS session ARN.
+3. States whether the **caller** is covered — directly or via a configured group
+   — and identifies the relevant **CDK bootstrap / CloudFormation execution
+   roles** as covered, uncovered, or unknown. It does not silently attach to
+   every role; exclusions are shown so the member chooses deliberately.
+4. Checks target format, duplicates, and applicable limits.
+5. **Rejects unsupported targets with an actionable message** — notably IAM
+   Identity Center `AWSReservedSSO_*` roles, which AWS protects from ordinary
+   modification and which cannot be a deny target.
+6. Confirms a named **recovery/admin route** can reverse the action or detach the
+   policy. Leaving `iam:*` undenied does **not** grant a limited user those
+   permissions — a real principal must hold them.
+7. Runs the budget preflight from §5.6 (`DescribeBudget`), printing effective
+   limit, action threshold in USD, period, scope, and cost metric.
+
+The **action role's** attach/detach permissions are scoped to the resolved target
+ARNs and the specific Budget Radar policy ARN — not `Resource: "*"`.
 
 ## 8. Coverage and honest gaps
 
@@ -333,12 +401,21 @@ live-test item.)
   creates both; the action has ≥1 target or synth fails; **deny does not deny
   `iam:*`** and uses `elasticmapreduce:`; `SAFETY` maps to the right
   `ApprovalModel`; config validation rejects empty targets, bad email, self-target.
+- **Handler bounds** (pytest) — a denied/failed read is reported as failed, never
+  as zero; the scan honors its deadline and marks unfinished areas
+  `not-scanned`; a report exceeding the 262,144-byte SNS cap is summarized or
+  split, never silently truncated into a completeness claim; `DescribeBudgetAction`
+  failure yields status `unknown` with inventory still sent.
+- **Preflight** (§7.7) — resolves targets to ARNs; correctly reports caller
+  covered/uncovered; flags CDK bootstrap / CFN execution roles; rejects
+  `AWSReservedSSO_*` and unsupported budgets with actionable messages.
 - **Live acceptance (disposable account), before "plug-and-play":** email
   confirmation gates only email; a warn threshold and the Lambda's report **never**
   invoke a second run; deploy works Path A (budget + subs preserved) and Path B;
-  in `watch` nothing is attached until approval; capture real pending/executed/
-  reversed/reset action events; confirm teardown works while armed and while
-  tripped.
+  in `watch` nothing is attached until approval; the report shows the **observed**
+  action status; run preflight with both the student's direct credentials and the
+  CDK deploy path; capture real pending/executed/reversed/reset action events;
+  confirm teardown works while armed and while tripped.
 
 ## 12. Cost
 
