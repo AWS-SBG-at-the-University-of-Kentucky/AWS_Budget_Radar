@@ -1,7 +1,7 @@
 // Positive list of spend-causing "create/launch" actions. NEVER Deny:*.
 // Deliberately excludes iam:*, budgets:*, cloudformation:*, and all read-only
 // actions so the member can always inspect state and detach this policy.
-export const DENY_ACTIONS: string[] = [
+export const DENY_ACTIONS: readonly string[] = Object.freeze([
   "ec2:RunInstances",
   "ec2:StartInstances",
   "rds:CreateDBInstance",
@@ -15,7 +15,7 @@ export const DENY_ACTIONS: string[] = [
   "ecs:CreateService",
   "autoscaling:CreateAutoScalingGroup",
   "lambda:CreateFunction"
-];
+]);
 
 export function denyPolicyDocument() {
   return {

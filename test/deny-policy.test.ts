@@ -16,7 +16,7 @@ test("never denies iam:, budgets:, read-only, or cloudformation:", () => {
     expect(a).not.toMatch(/^iam:/);
     expect(a).not.toMatch(/^budgets:/);
     expect(a).not.toMatch(/^cloudformation:/);
-    expect(a).not.toMatch(/^(Describe|List|Get)/);
+    expect(a).not.toMatch(/:(Describe|List|Get)/);
   }
 });
 
