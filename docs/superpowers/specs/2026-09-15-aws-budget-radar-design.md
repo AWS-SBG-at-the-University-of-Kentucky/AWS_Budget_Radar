@@ -79,8 +79,8 @@ deploys it believing they are protected in real time. A `FORECASTED` threshold
 
 **This is what makes the tool safe to leave unattended.** A member who trips the
 deny on the 20th is automatically un-blocked on the 1st, even if they never run
-`restore.sh`. `restore.sh` (§7.6) is therefore for *same-period* recovery — the
-across-period case self-heals.
+recovery. Recovery (§7.6) is therefore for *same-period* return-to-work — the
+across-period deny self-heals, but stopped resources still need a restart.
 
 ### 4.3 Action-enabled budgets cost money; monitoring budgets do not
 
@@ -154,12 +154,35 @@ From *"Creating an Amazon SNS topic for budget notifications"*:
 `StopDBInstance` is a 7-day snooze, not an off switch; AWS restarts RDS after
 seven days. Reported as such; not worked around.
 
-### 4.10 The Deny policy blocks its own reversal
+### 4.10 Recovery runs as the Lambda's role, which the deny never touches
 
-The deny denies `ec2:StartInstances`, `rds:StartDBInstance`, `ecs:UpdateService`,
-`autoscaling:UpdateAutoScalingGroup` — precisely the calls `restore.sh` must make.
-Explicit Deny beats every Allow. **`restore.sh` must detach the policy first, wait
-for IAM propagation (poll a canary call, not a fixed sleep), then restart.**
+The deny attaches to the member's IAM users/groups/roles — never to the Lambda's
+own execution role (§7.7 validates this). So the deny does not restrict the
+Lambda. **Recovery is therefore a mode of the Lambda** (§7.6), not a script run
+with the member's denied credentials: it detaches the deny and restarts resources
+in one pass, with no need to wait for IAM propagation, because the acting
+principal was never denied.
+
+### 4.11 `cdk destroy` does not restart stopped resources, and can conflict
+
+Two facts that govern teardown (§6):
+
+- The resources the Lambda stops (EC2, RDS, ASG, ECS, Lambda concurrency) are the
+  **member's own resources, not stack resources.** CloudFormation deletes only
+  what it created, so `cdk destroy` removes the watchdog and the deny policy but
+  **restarts nothing** — stopped resources stay off.
+- A managed policy cannot be deleted while attached (`DeletePolicy`: "you must
+  first detach the policy from all users, groups, and roles"). The console
+  auto-detaches; **CloudFormation, using the API, does not.** So if the deny is
+  applied at teardown, `cdk destroy` can fail with a `DeleteConflict`.
+- The restore record (§7.5) is a stack resource, so `cdk destroy` deletes it —
+  the map of what to restart is gone afterward.
+
+**Consequence: recover before you destroy.** Recovery (§7.6) detaches the deny and
+restarts resources; only then is `cdk destroy` clean. The README documents this
+ordering. (If a full budget period has elapsed, the deny has already
+auto-detached per §4.2, so destroy is clean — but stopped resources still need a
+restore first, while the record still exists.)
 
 ## 5. Architecture
 
@@ -202,6 +225,17 @@ npx cdk deploy
 Editing `.env` and re-running `cdk deploy` is also how settings change; there is
 no separate update path.
 
+**Teardown.** `npx cdk destroy` removes the watchdog. But it does not restart
+resources the Lambda stopped, and it can conflict on a still-attached deny policy
+(§4.11). So the order matters:
+
+1. If the deny is applied or resources are stopped, **run recovery first** (§7.6)
+   — it detaches the deny and restarts everything while the record still exists.
+2. Then `npx cdk destroy`.
+
+If a full budget period has passed the deny has already self-detached (§4.2), but
+stopped resources still need a recovery run before destroy deletes the record.
+
 ## 7. Components
 
 ### 7.1 Repository layout
@@ -213,7 +247,7 @@ lib/deny-policy.ts            the Deny policy document, isolated deliberately
 lib/config.ts                 .env parsing and validation
 lambda/handler.py             zero-dependency remediation handler (boto3 only)
 .env.example                  the only file a member edits
-restore.sh                    reverses everything (same-period recovery)
+restore.sh                    optional 3-line wrapper: aws lambda invoke restore mode
 test-fire.sh                  publishes a synthetic budget notification
 test/budget-radar.test.ts     CDK assertions (jest)
 tests/test_handler.py         handler logic (pytest, stubbed boto3)
@@ -252,6 +286,9 @@ the difference between a safety tool and a lockout.
 
 ### 7.4 The Lambda handler
 
+The handler dispatches on the event: `{"action":"restore"}` runs recovery (§7.6);
+anything else is a budget-notification **stop**, described here.
+
 0. **Check the snooze parameter** (§7.6). If snoozed and unexpired, publish
    "snoozed until X — taking no action" and exit.
 1. **Best-effort scope.** Regex the budget name from the prose message (§4.7) to
@@ -267,7 +304,8 @@ the difference between a safety tool and a lockout.
    4. ECS → `UpdateService` desiredCount = 0
    5. RDS → `StopDBInstance`
    6. SageMaker notebooks → `StopNotebookInstance`
-5. **Record and report.** Merge into the SSM record (§7.5); email a summary.
+5. **Record and report.** Merge into the SSM record (§7.5); email a summary that
+   includes how to recover (§7.6).
 
 **Never touched, always reported** under "still costing you money — needs your
 decision": EMR clusters, SageMaker endpoints, NAT Gateways, unattached EIPs, S3
@@ -281,34 +319,44 @@ already-stopped resource is a swallowed no-op.
 ### 7.5 Restore record
 
 One SSM Parameter, JSON, keyed by budget period. **Writes merge; never replace** —
-a second notification must not erase the first run's record, or `restore.sh` finds
-nothing to undo. Missing/empty record: `restore.sh` still detaches the policy and
-reports there was nothing to restart; it must not error.
+a second notification must not erase the first run's record, or recovery finds
+nothing to undo. Missing/empty record: recovery still detaches the policy and
+reports there was nothing to restart; it must not error. The record lives in the
+stack, so it is deleted by `cdk destroy` — recover before you destroy (§4.11).
 
-### 7.6 `restore.sh`
+### 7.6 Recovery (Lambda restore mode)
+
+The Lambda is dual-purpose. A normal budget notification triggers a **stop**; an
+invocation carrying `{"action": "restore"}` triggers a **restore**. The member
+runs it either from the Lambda console's Test button or with one command:
 
 ```bash
-./restore.sh [--snooze HOURS]
+aws lambda invoke --function-name BudgetRadar \
+  --payload '{"action":"restore"}' /dev/stdout
 ```
 
-Ordering derives from §4.10:
+`restore.sh` is an optional three-line wrapper around exactly that call, for
+members who prefer a script. It is not a separate implementation.
 
-1. **Detach the Deny policy** from every configured target.
-2. **Wait for IAM propagation** — poll a dry-run canary call until permitted.
-3. **Restart from the SSM record** — instances, Lambda concurrency, ASG/ECS
-   desired counts, RDS, SageMaker notebooks.
-4. **Apply snooze** if `--snooze` given: write a snooze-until timestamp to SSM,
-   **capped at 72 hours** so protection cannot be disabled for a whole period.
-5. **Report.** With snooze: when protection resumes. Without: warn that the budget
-   is still breached and Radar re-fires within 8–12 h; give the two remedies —
-   raise the budget and redeploy, or re-run with `--snooze`. Note that even with
-   no action, the deny self-clears at the next period (§4.2).
+Restore, running as the Lambda's un-denied role (§4.10):
 
-The shutdown email includes the literal `./restore.sh` command.
+1. **Detach the Deny policy** from every configured target, so new launches work
+   again. No IAM-propagation wait is needed — the Lambda was never denied.
+2. **Restart from the SSM record** — start instances, restore Lambda reserved
+   concurrency, scale ASGs and ECS services back to their *recorded* values (not
+   guesses), start RDS instances, start SageMaker notebooks, across all regions.
+3. **Apply a snooze** — write a snooze-until timestamp to SSM, **capped at 72
+   hours**, so the still-breached budget does not immediately re-stop everything.
+   Optional; the payload may set `{"action":"restore","snoozeHours":24}`.
+4. **Report** by email: what was restarted, the snooze window, and the reminder
+   that the deny also self-clears at the next budget period (§4.2).
 
-**Total lockout escape hatch.** If a member somehow cannot detach the policy, the
-documented recovery is to sign in as root and detach it in the IAM console. §7.3
-is designed so this is never necessary; the README documents it anyway.
+**Recover before `cdk destroy`** (§4.11): destroy deletes the SSM record and can
+conflict on the still-attached policy, so restore must run first.
+
+**Total lockout escape hatch.** The Lambda's role is never a deny target, so it
+can always detach the policy. If even that is somehow lost, the documented
+fallback is to sign in as root and detach the policy in the IAM console.
 
 ### 7.7 Configuration
 
@@ -384,8 +432,9 @@ absorbs the duplicate.
 3. **Positive-list Deny policy** (§7.3), with a self-lockout test.
 4. **Auto-detach at next period** (§4.2) — never a permanent lockout.
 5. **`BudgetRadar:Protect=true`** exempts any resource.
-6. **`restore.sh`** reverses everything in one command, in an order that works
-   while the deny is attached (§4.10), with a bounded 72-hour snooze.
+6. **Recovery is a Lambda mode** (§7.6) running as the un-denied Lambda role, so
+   it detaches the deny and restarts resources to recorded values in one pass,
+   with a bounded 72-hour snooze. Recover before `cdk destroy` (§4.11).
 7. **Reversible actions only.** No code path deletes or terminates anything.
 8. **Cannot restrain the root user** (IAM deny does not apply to root). Documented
    prominently; a member operating as root gets the Lambda half only.
@@ -401,9 +450,10 @@ absorbs the duplicate.
   exactly one action-enabled budget; Path A creates the action but **no** budget;
   Path B creates both; **deny policy does not deny `iam:*`**; `SAFETY` maps to the
   right `ApprovalModel`/`DRY_RUN`; config validation rejects bad input.
-- **`restore.sh` coverage** — restore succeeds *while the deny is attached*
-  (§4.10, the regression most likely to reappear); 72-hour snooze cap; empty SSM
-  record exits cleanly.
+- **Restore-mode coverage** (pytest) — an `{"action":"restore"}` event detaches
+  the deny and restarts ASG/ECS to their *recorded* values (not guesses) across
+  regions; 72-hour snooze cap enforced; empty/missing SSM record exits cleanly
+  without error.
 - **`test-fire.sh`** — publishes a realistic **prose** budget notification (§4.7)
   to the live topic, exercising the deployed Lambda end to end.
 
