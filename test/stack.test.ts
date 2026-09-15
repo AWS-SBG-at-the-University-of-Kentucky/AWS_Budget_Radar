@@ -161,3 +161,49 @@ test("reporter receives account/budget/action env identifiers", () => {
     ACTION_ID: expect.anything()
   }));
 });
+
+function dependsOnArray(resource: any): string[] {
+  const d = resource?.DependsOn;
+  if (!d) return [];
+  return Array.isArray(d) ? d : [d];
+}
+
+test("Path B: explicit CFN DependsOn wires action -> budget/role policy/trigger topic policy, and budget -> report topic policy", () => {
+  const { stack, template } = synthStack(cfg);
+
+  const triggerLogicalId = stack.getLogicalId(stack.triggerTopic.node.defaultChild as cdk.CfnElement);
+  const reportLogicalId = stack.getLogicalId(stack.reportTopic.node.defaultChild as cdk.CfnElement);
+
+  const topicPolicies = template.findResources("AWS::SNS::TopicPolicy");
+  const findPolicyLogicalId = (topicLogicalId: string): string => {
+    const entry = Object.entries(topicPolicies).find(([, res]: [string, any]) =>
+      (res.Properties.Topics as any[]).some(t => t.Ref === topicLogicalId)
+    );
+    expect(entry).toBeDefined();
+    return entry![0];
+  };
+  const triggerPolicyLogicalId = findPolicyLogicalId(triggerLogicalId);
+  const reportPolicyLogicalId = findPolicyLogicalId(reportLogicalId);
+
+  const rolePolicyL2 = stack.actionRole.node.tryFindChild("DefaultPolicy");
+  expect(rolePolicyL2).toBeDefined();
+  const rolePolicyLogicalId = stack.getLogicalId((rolePolicyL2 as any).node.defaultChild as cdk.CfnElement);
+
+  const budgetLogicalId = stack.getLogicalId(stack.node.findChild("Budget") as unknown as cdk.CfnElement);
+  const actionLogicalId = stack.getLogicalId(stack.node.findChild("BlockNewSpend") as unknown as cdk.CfnElement);
+
+  const actionResource = template.findResources("AWS::Budgets::BudgetsAction")[actionLogicalId];
+  expect(actionResource).toBeDefined();
+  expect(dependsOnArray(actionResource)).toEqual(expect.arrayContaining([
+    budgetLogicalId, rolePolicyLogicalId, triggerPolicyLogicalId
+  ]));
+
+  const budgetResource = template.findResources("AWS::Budgets::Budget")[budgetLogicalId];
+  expect(budgetResource).toBeDefined();
+  expect(dependsOnArray(budgetResource)).toEqual(expect.arrayContaining([reportPolicyLogicalId]));
+});
+
+test("a cross-account full-ARN deny target throws at synth", () => {
+  const badCfg: RadarConfig = { ...cfg, denyTargetRoles: ["arn:aws:iam::999999999999:role/Other"] };
+  expect(() => synth(badCfg)).toThrow(/different account/);
+});

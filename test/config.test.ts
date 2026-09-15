@@ -52,6 +52,33 @@ test("rejects WARN_AT_PERCENT out of range", () => {
   expect(() => loadConfig({ ...base, WARN_AT_PERCENT: "0" } as any)).toThrow(/WARN_AT_PERCENT/);
 });
 
+test("rejects a RECOVERY_PRINCIPAL_ARN that is not IAM-ARN-shaped", () => {
+  expect(() => loadConfig({ ...base, RECOVERY_PRINCIPAL_ARN: "not-an-arn" } as any)).toThrow(/full IAM ARN/);
+});
+
+test("rejects a wildcard deny target", () => {
+  expect(() => loadConfig({ ...base, IAM_DENY_TARGET_USERS: "*" } as any)).toThrow(/wildcards/);
+});
+
+test("rejects a bare-name recovery/target collision after normalization", () => {
+  const { IAM_DENY_TARGET_USERS, ...rest } = base as any;
+  expect(() => loadConfig({
+    ...rest,
+    IAM_DENY_TARGET_ROLES: "Admin",
+    RECOVERY_PRINCIPAL_ARN: "arn:aws:iam::111122223333:role/Admin"
+  } as any)).toThrow(/recovery principal/i);
+});
+
+test("no false positive when recovery and target are different identity types", () => {
+  const c = loadConfig({
+    ...base,
+    IAM_DENY_TARGET_USERS: "student",
+    RECOVERY_PRINCIPAL_ARN: "arn:aws:iam::111122223333:role/Admin"
+  } as any);
+  expect(c.denyTargetUsers).toEqual(["student"]);
+  expect(c.recoveryPrincipalArn).toBe("arn:aws:iam::111122223333:role/Admin");
+});
+
 test("parses SERVICE_BUDGETS list", () => {
   const c = loadConfig({ ...base, SERVICE_BUDGETS: "Amazon Elastic Compute Cloud - Compute:20,Amazon SageMaker:10" } as any);
   expect(c.serviceBudgets).toEqual([

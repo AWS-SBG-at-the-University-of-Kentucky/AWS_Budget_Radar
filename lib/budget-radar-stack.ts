@@ -42,8 +42,8 @@ export class BudgetRadarStack extends cdk.Stack {
           ArnLike: { "aws:SourceArn": `arn:aws:budgets::${account}:*` }
         }
       }));
-    budgetsPublish(this.triggerTopic);
-    budgetsPublish(this.reportTopic);
+    const triggerPolicy = budgetsPublish(this.triggerTopic);
+    const reportPolicy = budgetsPublish(this.reportTopic);
 
     // Email goes to the report topic only.
     this.reportTopic.addSubscription(new subs.EmailSubscription(config.alertEmail));
@@ -123,6 +123,7 @@ export class BudgetRadarStack extends cdk.Stack {
     // --- Determine the budget name and (Path B) create the budget. ---
     const budgetName = config.existingBudgetName ?? `budget-radar-${cdk.Names.uniqueId(this).slice(-8)}`;
 
+    let budget: cdk.aws_budgets.CfnBudget | undefined;
     if (!config.existingBudgetName) {
       const notifications = [
         // warn-only threshold -> report topic (email); does NOT trigger the Lambda
@@ -131,7 +132,7 @@ export class BudgetRadarStack extends cdk.Stack {
           subscribers: [{ subscriptionType: "SNS", address: this.reportTopic.topicArn }]
         }
       ];
-      new cdk.aws_budgets.CfnBudget(this, "Budget", {
+      budget = new cdk.aws_budgets.CfnBudget(this, "Budget", {
         budget: {
           budgetName,
           budgetType: "COST",
@@ -140,6 +141,9 @@ export class BudgetRadarStack extends cdk.Stack {
         },
         notificationsWithSubscribers: notifications
       });
+      // Budget publishes its warn notification to the report topic, which
+      // requires the report topic's publish policy to exist first.
+      if (reportPolicy.policyDependable) budget.node.addDependency(reportPolicy.policyDependable);
     }
 
     const action = new cdk.aws_budgets.CfnBudgetsAction(this, "BlockNewSpend", {
@@ -160,6 +164,14 @@ export class BudgetRadarStack extends cdk.Stack {
       subscribers: [{ type: "SNS", address: this.triggerTopic.topicArn }]
     });
 
+    // Explicit ordering: the action references its budget, execution role
+    // policy, and trigger topic only by name/ARN in the resource properties
+    // above, which CDK does not turn into a CFN DependsOn on its own.
+    if (budget) action.node.addDependency(budget); // action needs its budget first (Path B only)
+    const rolePolicy = this.actionRole.node.tryFindChild("DefaultPolicy");
+    if (rolePolicy) action.node.addDependency(rolePolicy); // role's attach/detach policy must exist for action lifecycle
+    if (triggerPolicy.policyDependable) action.node.addDependency(triggerPolicy.policyDependable); // budgets must be able to publish to the trigger topic
+
     // Give the reporter the identifiers it needs for DescribeBudgetAction.
     this.reporter.addEnvironment("ACCOUNT_ID", account);
     this.reporter.addEnvironment("BUDGET_NAME", budgetName);
@@ -167,7 +179,7 @@ export class BudgetRadarStack extends cdk.Stack {
 
     // --- Optional per-service warn budgets (notification-only, free). ---
     for (const [i, sb] of config.serviceBudgets.entries()) {
-      new cdk.aws_budgets.CfnBudget(this, `ServiceBudget${i}`, {
+      const svcBudget = new cdk.aws_budgets.CfnBudget(this, `ServiceBudget${i}`, {
         budget: {
           budgetName: `${budgetName}-svc-${i}`,
           budgetType: "COST",
@@ -180,12 +192,30 @@ export class BudgetRadarStack extends cdk.Stack {
           subscribers: [{ subscriptionType: "SNS", address: this.reportTopic.topicArn }]
         }]
       });
+      // Also publishes its warn notification to the report topic.
+      if (reportPolicy.policyDependable) svcBudget.node.addDependency(reportPolicy.policyDependable);
     }
   }
 
   private denyTargetArns(config: RadarConfig, account: string): string[] {
-    const arn = (kind: string, name: string) =>
-      name.startsWith("arn:") ? name : `arn:aws:iam::${account}:${kind}/${name}`;
+    const arn = (kind: string, name: string) => {
+      if (name.startsWith("arn:")) {
+        // Full ARN supplied: it must name this stack's own account. Budgets
+        // attach/detach is not designed for cross-account targets, and
+        // silently accepting one would let a typo'd/foreign ARN pass synth.
+        const arnAccount = name.split(":")[4];
+        if (arnAccount !== account) {
+          throw new Error(
+            `deny target ${name} is in a different account than the stack; attach/detach must be same-account`
+          );
+        }
+        return name;
+      }
+      // bare names assume IAM path '/'; identities under a non-root path
+      // MUST be supplied as full ARNs (the §7.7 preflight resolves the real
+      // ARN and rejects a mismatch).
+      return `arn:aws:iam::${account}:${kind}/${name}`;
+    };
     return [
       ...config.denyTargetUsers.map(u => arn("user", u)),
       ...config.denyTargetGroups.map(g => arn("group", g)),

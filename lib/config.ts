@@ -20,6 +20,19 @@ function list(v?: string): string[] {
   return (v ?? "").split(",").map(s => s.trim()).filter(Boolean);
 }
 
+// Matches a full IAM identity ARN, capturing (type, name) e.g.
+// "arn:aws:iam::123456789012:role/Admin" -> ["role", "Admin"].
+const IAM_ARN_RE = /^arn:aws[a-z-]*:iam::\d{12}:(user|group|role)\/(.+)$/;
+
+// Normalizes a deny-target entry (bare name or full ARN) to a "type/name"
+// form comparable across representations, e.g. bare "Admin" with kind "role"
+// and "arn:aws:iam::123456789012:role/Admin" both normalize to "role/Admin".
+function normalizeIdentity(kind: "user" | "group" | "role", raw: string): string {
+  const m = raw.match(IAM_ARN_RE);
+  if (m) return `${m[1]}/${m[2]}`;
+  return `${kind}/${raw}`;
+}
+
 export function loadConfig(env: NodeJS.ProcessEnv): RadarConfig {
   const email = (env.ALERT_EMAIL ?? "").trim();
   if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) {
@@ -32,13 +45,30 @@ export function loadConfig(env: NodeJS.ProcessEnv): RadarConfig {
   if (users.length + groups.length + roles.length === 0) {
     throw new Error("Provide at least one IAM deny target (IAM_DENY_TARGET_USERS/GROUPS/ROLES).");
   }
+  const targetsWithKind: Array<{ kind: "user" | "group" | "role"; raw: string }> = [
+    ...users.map(raw => ({ kind: "user" as const, raw })),
+    ...groups.map(raw => ({ kind: "group" as const, raw })),
+    ...roles.map(raw => ({ kind: "role" as const, raw }))
+  ];
+  for (const { raw } of targetsWithKind) {
+    if (raw.includes("*")) {
+      throw new Error(`IAM deny targets must be concrete identities, not wildcards: ${raw}`);
+    }
+  }
 
   const recovery = (env.RECOVERY_PRINCIPAL_ARN ?? "").trim();
   if (!recovery) {
     throw new Error("RECOVERY_PRINCIPAL_ARN is required (a principal that can reverse the action / detach the deny).");
   }
-  if ([...users, ...groups, ...roles].includes(recovery)) {
-    throw new Error("The recovery principal must not also be a deny target, or it could be blocked from recovering.");
+  const recoveryMatch = recovery.match(IAM_ARN_RE);
+  if (!recoveryMatch) {
+    throw new Error("RECOVERY_PRINCIPAL_ARN must be a full IAM ARN, e.g. arn:aws:iam::123456789012:role/Admin");
+  }
+  const recoveryResource = `${recoveryMatch[1]}/${recoveryMatch[2]}`;
+  for (const { kind, raw } of targetsWithKind) {
+    if (normalizeIdentity(kind, raw) === recoveryResource) {
+      throw new Error(`The recovery principal must not also be a deny target (matched target: ${raw})`);
+    }
   }
 
   const safety = (env.SAFETY ?? "watch").trim() as Safety;
