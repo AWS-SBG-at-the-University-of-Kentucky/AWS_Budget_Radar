@@ -24,16 +24,19 @@ def test_observe_action_status_reads_observed_status(monkeypatch):
     stub.activate()
     monkeypatch.setattr(handler, "_client", lambda svc, region=None: client)
     monkeypatch.setenv("ACCOUNT_ID", "111122223333")
-    status, ts = handler.observe_action_status("111122223333", "b", "11111111-1111-1111-1111-111111111111")
+    status, ts, details = handler.observe_action_status("111122223333", "b", "11111111-1111-1111-1111-111111111111")
     assert status == "EXECUTION_SUCCESS"
     assert ts  # ISO timestamp present
+    assert details["threshold_value"] == 100.0
+    assert details["threshold_type"] == "PERCENTAGE"
 
 def test_observe_action_status_unknown_on_failure(monkeypatch):
     def boom(svc, region=None):
         raise RuntimeError("no perms")
     monkeypatch.setattr(handler, "_client", boom)
-    status, ts = handler.observe_action_status("x", "b", "a")
+    status, ts, details = handler.observe_action_status("x", "b", "a")
     assert status == "UNKNOWN"
+    assert details is None
 
 def test_handler_ignores_events_not_from_trigger_topic(monkeypatch):
     monkeypatch.setenv("TRIGGER_TOPIC_ARN", "arn:aws:sns:us-east-1:111122223333:Trigger")
@@ -69,7 +72,7 @@ def test_handler_calls_enabled_regions_and_inventory_when_triggered(monkeypatch)
         return {"areas": [], "generated": "2024-01-01T00:00:00+00:00"}
 
     def fake_observe_action_status(account_id, budget_name, action_id):
-        return "EXECUTION_SUCCESS", "2024-01-01T00:00:00+00:00"
+        return "EXECUTION_SUCCESS", "2024-01-01T00:00:00+00:00", None
 
     def fake_publish(topic_arn, subject, body):
         called["publish"] = True
@@ -77,7 +80,7 @@ def test_handler_calls_enabled_regions_and_inventory_when_triggered(monkeypatch)
     monkeypatch.setattr(handler, "enabled_regions", fake_enabled_regions)
     monkeypatch.setattr(handler, "inventory", fake_inventory)
     monkeypatch.setattr(handler, "observe_action_status", fake_observe_action_status)
-    monkeypatch.setattr(handler, "s3_bucket_sizes", lambda: [])
+    monkeypatch.setattr(handler, "s3_bucket_sizes", lambda deadline_epoch=None: [])
     monkeypatch.setattr(handler, "publish", fake_publish)
     event = {"Records": [{"Sns": {"TopicArn": "arn:aws:sns:us-east-1:111122223333:Trigger", "Message": "x"}}]}
     result = handler.handler(event, None)
@@ -101,7 +104,7 @@ def test_enabled_regions(monkeypatch):
 
 
 def test_denied_read_is_reported_failed_not_zero(monkeypatch):
-    def adapter_fail(region):
+    def adapter_fail(region, deadline=None):
         raise RuntimeError("AccessDenied")
     monkeypatch.setattr(handler, "ADAPTERS", {"ec2-instances": adapter_fail})
     monkeypatch.setattr(handler, "enabled_regions", lambda: ["us-east-1"])
@@ -113,9 +116,33 @@ def test_denied_read_is_reported_failed_not_zero(monkeypatch):
 
 
 def test_deadline_marks_unscanned(monkeypatch):
-    monkeypatch.setattr(handler, "ADAPTERS", {"ec2-instances": lambda r: []})
+    monkeypatch.setattr(handler, "ADAPTERS", {"ec2-instances": lambda r, deadline=None: []})
     result = handler.inventory(["us-east-1", "eu-west-1"], deadline_epoch=time.time() - 1)  # already past
     assert any(a["state"] == "not_scanned" for a in result["areas"])
+
+
+def test_deadline_marks_unscanned_mid_scan(monkeypatch):
+    """A real mid-scan expiry (not a pre-expired deadline): the deadline is
+    still fine for the first region/adapter combo, then crossed partway
+    through the scan -> earlier areas complete, later ones are not_scanned."""
+    monkeypatch.setattr(handler, "ADAPTERS", {
+        "svc-a": lambda r, deadline=None: [f"item-a-{r}"],
+        "svc-b": lambda r, deadline=None: [f"item-b-{r}"],
+    })
+    clock = {"t": 0.0}
+
+    def fake_time():
+        clock["t"] += 1
+        return clock["t"]
+
+    monkeypatch.setattr(handler.time, "time", fake_time)
+    # tick 1 (pre-check for region1/svc-a) = 1.0, not past; tick 2 (pre-check
+    # for region1/svc-b) = 2.0, past -> everything from there on is not_scanned.
+    result = handler.inventory(["us-east-1", "eu-west-1"], deadline_epoch=1.5)
+    areas = result["areas"]
+    assert areas[0]["state"] == "complete"
+    assert areas[0]["items"] == ["item-a-us-east-1"]
+    assert all(a["state"] == "not_scanned" for a in areas[1:])
 
 
 def _assert_adapter_failure(monkeypatch, service, adapter_name, adapter_fn, error_op, error_code="AccessDenied"):
@@ -197,7 +224,7 @@ def test_ecs_services_returns_items(monkeypatch):
         {"cluster": cluster_arn, "services": [service_arn]})
     stub.activate()
     monkeypatch.setattr(handler, "_client", lambda svc, region=None: client)
-    assert handler._ecs_services("us-east-1") == ["s1 (2 running) in us-east-1"]
+    assert handler._ecs_services("us-east-1") == ["s1 (2 running, REPLICA) in us-east-1"]
 
 
 def test_ecs_services_access_failure_is_failed(monkeypatch):
@@ -432,7 +459,7 @@ def test_handler_reports_even_when_enabled_regions_raises(monkeypatch):
         raise RuntimeError("region enumeration denied")
 
     def fake_observe_action_status(account_id, budget_name, action_id):
-        return "EXECUTION_SUCCESS", "2024-01-01T00:00:00+00:00"
+        return "EXECUTION_SUCCESS", "2024-01-01T00:00:00+00:00", None
 
     def fake_publish(topic_arn, subject, body):
         published["called"] = True
@@ -440,7 +467,7 @@ def test_handler_reports_even_when_enabled_regions_raises(monkeypatch):
 
     monkeypatch.setattr(handler, "enabled_regions", boom_enabled_regions)
     monkeypatch.setattr(handler, "observe_action_status", fake_observe_action_status)
-    monkeypatch.setattr(handler, "s3_bucket_sizes", lambda: [])
+    monkeypatch.setattr(handler, "s3_bucket_sizes", lambda deadline_epoch=None: [])
     monkeypatch.setattr(handler, "publish", fake_publish)
 
     event = {"Records": [{"Sns": {"TopicArn": "arn:aws:sns:us-east-1:111122223333:Trigger", "Message": "x"}}]}
@@ -532,3 +559,236 @@ def test_triggered_path_makes_no_mutation_only_reads_and_publish(monkeypatch):
     # sns.publish is the one allowed "verb-like" call (starts with none of the
     # mutating verbs) and must actually have happened.
     assert any(c == "sns.publish" for c in calls)
+
+
+# --- Task 13 (corrective) regression tests ---
+
+import pytest
+
+
+# --- F1: real deadline protects report delivery ---
+
+def test_ec2_instances_deadline_exceeded_mid_pagination_preserves_partial(monkeypatch):
+    client = boto3.client("ec2", region_name="us-east-1")
+    stub = Stubber(client)
+    filt = {"Filters": [{"Name": "instance-state-name", "Values": ["running", "pending"]}]}
+    stub.add_response("describe_instances",
+        {"Reservations": [{"Instances": [{"InstanceId": "i-1", "InstanceType": "t3.micro"}]}],
+         "NextToken": "n1"},
+        filt)
+    stub.add_response("describe_instances",
+        {"Reservations": [{"Instances": [{"InstanceId": "i-2", "InstanceType": "t3.micro"}]}]},
+        {**filt, "NextToken": "n1"})
+    stub.activate()
+    monkeypatch.setattr(handler, "_client", lambda svc, region=None: client)
+
+    clock = {"t": 0.0}
+
+    def fake_time():
+        clock["t"] += 1
+        return clock["t"]
+
+    monkeypatch.setattr(handler.time, "time", fake_time)
+
+    with pytest.raises(handler.DeadlineExceeded) as exc_info:
+        handler._ec2_instances("us-east-1", deadline=1.5)  # past by the 2nd page check
+    assert exc_info.value.items_so_far == ["i-1 t3.micro in us-east-1"]
+
+
+def test_inventory_reports_partial_state_when_adapter_raises_deadline_exceeded(monkeypatch):
+    def half_scanned(region, deadline=None):
+        raise handler.DeadlineExceeded(["partial-item"])
+    monkeypatch.setattr(handler, "ADAPTERS", {"ec2-instances": half_scanned})
+    result = handler.inventory(["us-east-1"], deadline_epoch=time.time() + 60)
+    area = result["areas"][0]
+    assert area["state"] == "partial"
+    assert area["items"] == ["partial-item"]
+
+
+def test_s3_bucket_sizes_stops_at_deadline_mid_scan(monkeypatch):
+    class S3:
+        def list_buckets(self):
+            return {"Buckets": [{"Name": "b1"}, {"Name": "b2"}]}
+
+        def get_bucket_location(self, Bucket):
+            return {"LocationConstraint": ""}
+
+    cw_calls = {"n": 0}
+
+    class CW:
+        def get_metric_data(self, **kw):
+            cw_calls["n"] += 1
+            return {"MetricDataResults": [{"Values": [1.0], "Timestamps": [dt.datetime(2026, 9, 15)]}]}
+
+    def fake_client(svc, region=None):
+        return S3() if svc == "s3" else CW()
+
+    monkeypatch.setattr(handler, "_client", fake_client)
+
+    clock = {"t": 0.0}
+
+    def fake_time():
+        clock["t"] += 1
+        return clock["t"]
+
+    monkeypatch.setattr(handler.time, "time", fake_time)
+
+    lines = handler.s3_bucket_sizes(deadline_epoch=1.5)  # deadline crosses between the two buckets
+    assert any("stopped early" in l.lower() for l in lines)
+    assert cw_calls["n"] == 1  # only the first bucket was sized before the deadline hit
+
+
+def test_handler_still_publishes_when_deadline_crosses_during_s3_sizing(monkeypatch):
+    monkeypatch.setenv("TRIGGER_TOPIC_ARN", "arn:aws:sns:us-east-1:111122223333:Trigger")
+    monkeypatch.setenv("ACCOUNT_ID", "111122223333")
+    monkeypatch.setenv("BUDGET_NAME", "b")
+    monkeypatch.setenv("ACTION_ID", "11111111-1111-1111-1111-111111111111")
+    monkeypatch.setenv("REPORT_TOPIC_ARN", "arn:aws:sns:us-east-1:111122223333:Report")
+
+    monkeypatch.setattr(handler, "enabled_regions", lambda: [])
+    monkeypatch.setattr(handler, "observe_action_status",
+                         lambda a, b, c: ("EXECUTION_SUCCESS", "2024-01-01T00:00:00+00:00", None))
+    monkeypatch.setattr(handler, "inventory",
+                         lambda regions, deadline_epoch: {"areas": [], "generated": "2024-01-01T00:00:00+00:00"})
+
+    def slow_s3_bucket_sizes(deadline_epoch=None):
+        assert deadline_epoch is not None  # the real deadline was threaded through
+        return ["S3 bucket sizing stopped early (scan deadline reached); 1 of 2 bucket(s) not sized."]
+
+    monkeypatch.setattr(handler, "s3_bucket_sizes", slow_s3_bucket_sizes)
+
+    published = {}
+
+    def fake_publish(topic_arn, subject, body):
+        published["called"] = True
+        published["body"] = body
+
+    monkeypatch.setattr(handler, "publish", fake_publish)
+
+    event = {"Records": [{"Sns": {"TopicArn": "arn:aws:sns:us-east-1:111122223333:Trigger", "Message": "x"}}]}
+    result = handler.handler(event, None)
+
+    assert result["status"] == "reported"
+    assert published.get("called") is True
+    assert "stopped early" in published["body"].lower()
+
+
+# --- F6: S3 sizing resolves bucket region, labels storage class, never guesses ---
+
+def test_s3_bucket_sizes_resolves_region_and_labels_storage_class(monkeypatch):
+    cw_regions = []
+
+    class S3:
+        def list_buckets(self):
+            return {"Buckets": [{"Name": "eu-bucket"}]}
+
+        def get_bucket_location(self, Bucket):
+            return {"LocationConstraint": "eu-west-1"}
+
+    class CW:
+        def get_metric_data(self, **kw):
+            return {"MetricDataResults": [{"Values": [12345.0], "Timestamps": [dt.datetime(2026, 9, 15)]}]}
+
+    def fake_client(svc, region=None):
+        if svc == "s3":
+            return S3()
+        if svc == "cloudwatch":
+            cw_regions.append(region)
+            return CW()
+        raise AssertionError(f"unexpected service {svc}")
+
+    monkeypatch.setattr(handler, "_client", fake_client)
+    lines = handler.s3_bucket_sizes()
+    assert cw_regions == ["eu-west-1"]
+    assert any("eu-west-1" in l and "StandardStorage" in l for l in lines)
+
+
+def test_s3_bucket_region_lookup_failure_is_unknown_not_guessed(monkeypatch):
+    class S3:
+        def list_buckets(self):
+            return {"Buckets": [{"Name": "mystery-bucket"}]}
+
+        def get_bucket_location(self, Bucket):
+            raise RuntimeError("AccessDenied")
+
+    def fake_client(svc, region=None):
+        if svc == "s3":
+            return S3()
+        raise AssertionError("cloudwatch must not be queried when region resolution fails")
+
+    monkeypatch.setattr(handler, "_client", fake_client)
+    lines = handler.s3_bucket_sizes()
+    assert any("unknown" in l.lower() for l in lines)
+    assert not any("us-east-1" in l for l in lines)
+
+
+# --- F7: ECS in-band failures[] must not read as empty/complete ---
+
+def test_ecs_services_all_failures_not_reported_as_empty(monkeypatch):
+    client = boto3.client("ecs", region_name="us-east-1")
+    stub = Stubber(client)
+    cluster_arn = "arn:aws:ecs:us-east-1:111122223333:cluster/c1"
+    service_arn = "arn:aws:ecs:us-east-1:111122223333:service/c1/s1"
+    stub.add_response("list_clusters", {"clusterArns": [cluster_arn]}, {})
+    stub.add_response("list_services", {"serviceArns": [service_arn]}, {"cluster": cluster_arn})
+    stub.add_response("describe_services",
+        {"services": [], "failures": [{"arn": service_arn, "reason": "MISSING"}]},
+        {"cluster": cluster_arn, "services": [service_arn]})
+    stub.activate()
+    monkeypatch.setattr(handler, "_client", lambda svc, region=None: client)
+    monkeypatch.setattr(handler, "ADAPTERS", {"ecs-services": handler._ecs_services})
+
+    result = handler.inventory(["us-east-1"], deadline_epoch=time.time() + 60)
+    area = result["areas"][0]
+    assert area["state"] != "empty"
+    assert area["state"] == "failed"
+    assert "MISSING" in area.get("error", "")
+
+
+def test_ecs_services_mixed_success_and_failure_both_visible(monkeypatch):
+    client = boto3.client("ecs", region_name="us-east-1")
+    stub = Stubber(client)
+    cluster_arn = "arn:aws:ecs:us-east-1:111122223333:cluster/c1"
+    ok_arn = "arn:aws:ecs:us-east-1:111122223333:service/c1/s1"
+    bad_arn = "arn:aws:ecs:us-east-1:111122223333:service/c1/s2"
+    stub.add_response("list_clusters", {"clusterArns": [cluster_arn]}, {})
+    stub.add_response("list_services", {"serviceArns": [ok_arn, bad_arn]}, {"cluster": cluster_arn})
+    stub.add_response("describe_services",
+        {"services": [{"serviceName": "s1", "runningCount": 2}],
+         "failures": [{"arn": bad_arn, "reason": "MISSING"}]},
+        {"cluster": cluster_arn, "services": [ok_arn, bad_arn]})
+    stub.activate()
+    monkeypatch.setattr(handler, "_client", lambda svc, region=None: client)
+
+    lines = handler._ecs_services("us-east-1")
+    assert any("s1" in l and "running" in l for l in lines)
+    assert any("MISSING" in l and bad_arn in l for l in lines)
+
+
+# --- F8: truncation notice must be truthful (the full body is actually logged) ---
+
+def test_fit_logs_full_report_before_truncating(capsys):
+    huge = "MARKER-START " + ("x" * 5000 + "\n") * 100 + " MARKER-END"
+    fitted = handler._fit(huge, limit=1000)
+    assert len(fitted.encode("utf-8")) <= 1000
+    assert "MARKER-END" not in fitted  # the fitted/truncated message itself is cut short
+
+    captured = capsys.readouterr()
+    assert "MARKER-START" in captured.out
+    assert "MARKER-END" in captured.out  # content beyond the truncation point was logged
+
+
+# --- F9: report wording follows OBSERVED status + required header fields ---
+
+def test_build_report_execution_failure_does_not_claim_auto_applied_and_has_header_fields():
+    inv = {"areas": [], "generated": "2026-09-15T00:00:00+00:00"}
+    action_details = {"threshold_value": 100.0, "threshold_type": "ACTUAL",
+                       "approval_model": "AUTOMATIC", "targets": ["user:student"]}
+    body = handler.build_report("EXECUTION_FAILURE", "2026-09-15T00:00:00+00:00", inv, "armed",
+                                 account_id="111122223333", budget_name="my-budget",
+                                 action_details=action_details)
+    assert "auto-applied" not in body.lower()
+    assert "FAILED" in body
+    assert "111122223333" in body
+    assert "my-budget" in body
+    assert "100" in body and "%" in body

@@ -273,8 +273,9 @@ action's `Fn::GetAtt ActionId`) are passed as env vars.
    arrive after the action changed state, and `MANUAL` may still be pending. If
    the lookup fails, status is **unknown** and the inventory is still sent.
 3. **Enumerate enabled regions** (`DescribeRegions`), paginating every list call,
-   with bounded parallelism and an overall **scan deadline** that reserves a
-   margin for publishing.
+   with a **serial scan and a hard deadline** (derived from the Lambda context's
+   remaining time, margin reserved for publishing) that every adapter's
+   pagination loop checks between pages — not bounded parallelism.
 4. **Inventory** running EC2 (+ ASG membership noted), RDS/Aurora, ECS
    services/tasks, Lambda functions (reserved vs provisioned concurrency),
    SageMaker notebooks/endpoints, plus **"still costing you money"**: EBS, NAT

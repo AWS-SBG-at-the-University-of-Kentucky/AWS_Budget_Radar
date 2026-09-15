@@ -166,6 +166,19 @@ test("reporter receives account/budget/action env identifiers", () => {
   }));
 });
 
+test("reporter role is granted s3:GetBucketLocation (read-only, needed to size buckets in their own region)", () => {
+  const t = synth(cfg);
+  t.hasResourceProperties("AWS::IAM::Policy", Match.objectLike({
+    PolicyDocument: Match.objectLike({
+      Statement: Match.arrayWith([
+        Match.objectLike({
+          Action: Match.arrayWith(["s3:ListAllMyBuckets", "s3:GetBucketLocation"])
+        })
+      ])
+    })
+  }));
+});
+
 function dependsOnArray(resource: any): string[] {
   const d = resource?.DependsOn;
   if (!d) return [];
