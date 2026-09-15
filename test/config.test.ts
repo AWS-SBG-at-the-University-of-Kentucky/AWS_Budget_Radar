@@ -79,6 +79,18 @@ test("no false positive when recovery and target are different identity types", 
   expect(c.recoveryPrincipalArn).toBe("arn:aws:iam::111122223333:role/Admin");
 });
 
+test("same name, different identity type: role recovery 'Admin' vs user target 'Admin' does not collide", () => {
+  // A plain string .includes()/equality check would wrongly treat these as
+  // the same identity (both "Admin"); the normalized "type/name" comparison
+  // must distinguish role/Admin from user/Admin and allow this to load.
+  const c = loadConfig({
+    ...base,
+    IAM_DENY_TARGET_USERS: "Admin",
+    RECOVERY_PRINCIPAL_ARN: "arn:aws:iam::111122223333:role/Admin"
+  } as any);
+  expect(c.denyTargetUsers).toContain("Admin");
+});
+
 test("parses SERVICE_BUDGETS list", () => {
   const c = loadConfig({ ...base, SERVICE_BUDGETS: "Amazon Elastic Compute Cloud - Compute:20,Amazon SageMaker:10" } as any);
   expect(c.serviceBudgets).toEqual([
