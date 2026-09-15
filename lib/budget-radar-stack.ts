@@ -105,12 +105,18 @@ export class BudgetRadarStack extends cdk.Stack {
         }
       })
     });
-    // Scope attach/detach to the specific policy + resolved target ARNs (Task 5 adds targets).
+    // Scope attach/detach to the resolved target ARNs (entity dimension) AND the
+    // specific DenyNewSpend policy (iam:PolicyARN condition — IAM scopes the
+    // which-policy dimension via a condition key, not the resource), so this role
+    // can never attach/detach an arbitrary managed policy.
     this.actionRole.addToPolicy(new iam.PolicyStatement({
       actions: ["iam:AttachUserPolicy", "iam:DetachUserPolicy",
                 "iam:AttachGroupPolicy", "iam:DetachGroupPolicy",
                 "iam:AttachRolePolicy", "iam:DetachRolePolicy"],
-      resources: this.denyTargetArns(config, account)
+      resources: this.denyTargetArns(config, account),
+      conditions: {
+        ArnEquals: { "iam:PolicyARN": this.denyPolicy.managedPolicyArn }
+      }
     }));
   }
 

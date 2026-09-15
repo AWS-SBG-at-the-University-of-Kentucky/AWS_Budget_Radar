@@ -16,6 +16,12 @@ function synth(config: RadarConfig): Template {
   return Template.fromStack(stack);
 }
 
+function synthStack(config: RadarConfig): { stack: BudgetRadarStack; template: Template } {
+  const app = new cdk.App();
+  const stack = new BudgetRadarStack(app, "TestStack", { config, env: { account: "111122223333", region: "us-east-1" } });
+  return { stack, template: Template.fromStack(stack) };
+}
+
 test("creates exactly two SNS topics, both unencrypted", () => {
   const t = synth(cfg);
   t.resourceCountIs("AWS::SNS::Topic", 2);
@@ -25,33 +31,47 @@ test("creates exactly two SNS topics, both unencrypted", () => {
   }
 });
 
-test("topic policies grant budgets.amazonaws.com publish with confused-deputy conditions", () => {
+test("both topic policies grant budgets.amazonaws.com publish with confused-deputy conditions", () => {
   const t = synth(cfg);
-  t.hasResourceProperties("AWS::SNS::TopicPolicy", {
-    PolicyDocument: Match.objectLike({
-      Statement: Match.arrayWith([
-        Match.objectLike({
-          Principal: { Service: "budgets.amazonaws.com" },
-          Action: "sns:Publish",
-          Condition: Match.objectLike({
-            StringEquals: Match.objectLike({ "aws:SourceAccount": "111122223333" }),
-            ArnLike: Match.objectLike({ "aws:SourceArn": "arn:aws:budgets::111122223333:*" })
-          })
-        })
-      ])
-    })
-  });
+  const policies = t.findResources("AWS::SNS::TopicPolicy");
+  const keys = Object.keys(policies);
+  expect(keys.length).toBe(2); // one per topic — TriggerTopic and ReportTopic
+  for (const key of keys) {
+    const statements: any[] = policies[key].Properties.PolicyDocument.Statement;
+    const hasConfusedDeputyGrant = statements.some(s =>
+      s.Principal?.Service === "budgets.amazonaws.com" &&
+      s.Action === "sns:Publish" &&
+      s.Condition?.StringEquals?.["aws:SourceAccount"] === "111122223333" &&
+      s.Condition?.ArnLike?.["aws:SourceArn"] === "arn:aws:budgets::111122223333:*"
+    );
+    expect(hasConfusedDeputyGrant).toBe(true);
+  }
 });
 
-test("email subscription is on the report topic; lambda subscription exists", () => {
+test("email subscription is on the report topic", () => {
   const t = synth(cfg);
   t.hasResourceProperties("AWS::SNS::Subscription", Match.objectLike({ Protocol: "email", Endpoint: "a@b.edu" }));
-  t.hasResourceProperties("AWS::SNS::Subscription", Match.objectLike({ Protocol: "lambda" }));
+});
+
+test("lambda subscription is on the trigger topic, not the report topic", () => {
+  const { stack, template } = synthStack(cfg);
+  const triggerLogicalId = stack.getLogicalId(stack.triggerTopic.node.defaultChild as cdk.CfnElement);
+  const reportLogicalId = stack.getLogicalId(stack.reportTopic.node.defaultChild as cdk.CfnElement);
+
+  const lambdaSubs = template.findResources("AWS::SNS::Subscription", {
+    Properties: Match.objectLike({ Protocol: "lambda" })
+  });
+  const lambdaSubResources = Object.values(lambdaSubs);
+  expect(lambdaSubResources.length).toBeGreaterThan(0);
+  for (const sub of lambdaSubResources) {
+    expect(sub.Properties.TopicArn).toEqual({ Ref: triggerLogicalId });
+    expect(sub.Properties.TopicArn).not.toEqual({ Ref: reportLogicalId });
+  }
 });
 
 test("lambda is python3.13, 900s, with a failure destination", () => {
   const t = synth(cfg);
-  t.hasResourceProperties("AWS::Lambda::Function", Match.objectLike({ Runtime: "python3.13", Timeout: 900 }));
+  t.hasResourceProperties("AWS::Lambda::Function", Match.objectLike({ Runtime: "python3.13", Timeout: 900, MemorySize: 512 }));
   t.resourceCountIs("AWS::SQS::Queue", 1);
   t.hasResourceProperties("AWS::Lambda::EventInvokeConfig", Match.objectLike({
     DestinationConfig: Match.objectLike({ OnFailure: Match.anyValue() })
@@ -80,6 +100,24 @@ test("action role trusts budgets.amazonaws.com", () => {
     AssumeRolePolicyDocument: Match.objectLike({
       Statement: Match.arrayWith([
         Match.objectLike({ Principal: { Service: "budgets.amazonaws.com" } })
+      ])
+    })
+  }));
+});
+
+test("action role attach/detach statement is scoped to the DenyNewSpend policy ARN", () => {
+  const t = synth(cfg);
+  t.hasResourceProperties("AWS::IAM::Policy", Match.objectLike({
+    PolicyDocument: Match.objectLike({
+      Statement: Match.arrayWith([
+        Match.objectLike({
+          Action: Match.arrayWith(["iam:AttachUserPolicy", "iam:DetachUserPolicy"]),
+          Condition: Match.objectLike({
+            ArnEquals: Match.objectLike({
+              "iam:PolicyARN": Match.objectLike({ Ref: Match.stringLikeRegexp("DenyNewSpend") })
+            })
+          })
+        })
       ])
     })
   }));
