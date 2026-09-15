@@ -20,34 +20,32 @@ AWS ships two halves of a solution and joins neither to the other:
 Hardcoded instance IDs are exactly useless for the real problem, which is always
 the resource nobody remembered to list.
 
-Budget Radar closes that gap: a clone-and-deploy stack that, when a budget
+Budget Radar closes that gap: a clone-and-deploy CDK app that, when a budget
 threshold is crossed, **discovers what is actually running and reversibly shuts
 it down**, while simultaneously **blocking new launches**.
 
 ## 2. Goals
 
-1. Clone, edit one `.env`, run one command. No AWS console clicking.
-2. Deployable by someone who has never used CDK or installed Node.
-3. When a budget is breached: stop what is running, block what would launch next.
-4. Never destroy anything. Every action reversible by one command.
-5. Cost nothing to run.
+1. Clone, edit one `.env`, run `cdk deploy`. No console clicking.
+2. When a budget is breached: stop what is running, block what would launch next.
+3. Never destroy anything. Every action reversible by one command.
+4. Cost nothing to run.
 
 ## 3. Non-goals
 
 Deliberately excluded to keep v1 honest:
 
-- **Real-time protection.** See constraint 4.1. This reacts in hours, not minutes.
+- **Real-time protection.** See §4.1. This reacts in hours, not minutes.
 - **Multi-account / AWS Organizations / SCPs.** Target is individual accounts.
-- **Slack or Discord alerts.** Email only for v1. A webhook is a small, additive
-  change later; it is not in scope now.
-- **Cost forecasting or reporting dashboards.** AWS Budgets already does this.
+- **Slack or Discord alerts.** Email only for v1.
+- **Cost forecasting or dashboards.** AWS Budgets already does this.
 - **Destructive remediation.** EMR termination and SageMaker endpoint deletion
   are reported, never performed.
 
 ## 4. Constraints that shaped the design
 
-These are verified facts, each of which forced a decision. They are recorded so
-that implementation does not "fix" a deliberate choice.
+Verified facts, each of which forced a decision. Recorded so implementation does
+not "fix" a deliberate choice.
 
 ### 4.1 Budget data lags 8–12 hours
 
@@ -55,13 +53,13 @@ that implementation does not "fix" a deliberate choice.
 > occur 8–12 hours after the previous update."
 > — *Use a budget in the AWS Billing and Cost Management console*
 
-Billing data itself lags behind actual usage on top of that. **A budget
-threshold is therefore a backstop, not a real-time trigger.** A GPU instance
-launched at 2pm may not trip the budget until the small hours.
+Billing data itself lags actual usage on top of that. **A budget threshold is a
+backstop, not a real-time trigger.** A GPU instance launched at 2pm may not trip
+the budget until the small hours.
 
-This was accepted knowingly: it trades responsiveness for a system that is
-simple to explain, audit, and teach. The README must state this plainly so
-nobody deploys it believing they are protected in real time.
+Accepted knowingly: it trades responsiveness for a system that is simple to
+explain, audit, and teach. The README must state this plainly so nobody deploys
+it believing they are protected in real time.
 
 ### 4.2 Action-enabled budgets cost money; monitoring budgets do not
 
@@ -73,48 +71,34 @@ the IAM Deny action. Every per-service budget is notification-only and free. The
 Lambda performs per-service remediation, so nothing is lost. Total recurring
 cost: **$0**.
 
-A naive design attaching an action per service would cost ~$3/month per service.
+A design attaching an action per service would cost ~$3/month per service.
 
 ### 4.3 IAM Deny policies cannot restrain the root user
 
 Budget actions attach policies to IAM users, groups, and roles. The root account
 ignores them. A member operating as root gets the Lambda half only, silently.
 
-The README must make this prominent, and `deploy.sh` must warn when no IAM deny
+The README must make this prominent, and synth must warn when no IAM deny
 targets are configured.
 
-### 4.4 `cdk synth` freezes configuration at synth time
-
-`template.yaml` is committed so members can deploy without Node. If `.env` drove
-TypeScript constants, that template would encode the repo author's settings.
-
-**Consequence: all configuration flows through CloudFormation `Parameters`,
-never synth-time constants.** Conditional resources use `CfnCondition`.
-
-Because CloudFormation cannot iterate a parameter to create N resources, the
-per-service budgets are implemented as **five fixed slots**, each gated by a
-condition on whether its name parameter is empty. The CDK path could support
-arbitrary N, but does not: divergence between the two paths would defeat the
-single-source-of-truth decision in §6. Five covers realistic club use.
-
-### 4.5 Per-service cost filters need exact AWS service names
+### 4.4 Per-service cost filters need exact AWS service names
 
 Budget `CostFilters` on `SERVICE` match display names such as
 `Amazon Elastic Compute Cloud - Compute`, not `ec2`. `.env.example` ships with
-the exact strings pre-filled and commented. No friendly-name mapping layer —
-it would be one more thing to get subtly wrong.
+the exact strings pre-filled and commented. No friendly-name mapping layer — it
+would be one more thing to get subtly wrong.
 
-### 4.6 Stopping an ASG member does not stop it
+### 4.5 Stopping an ASG member does not stop it
 
 An EC2 instance in an Auto Scaling Group is replaced when stopped. **ASGs must be
 scaled to zero before EC2 instances are touched**, or remediation silently fails.
 
-### 4.7 RDS stop expires after 7 days
+### 4.6 RDS stop expires after 7 days
 
 `StopDBInstance` is a snooze, not an off switch; AWS restarts the instance after
 seven days. Reported to the user as such; not worked around.
 
-### 4.8 The Deny policy blocks its own reversal
+### 4.7 The Deny policy blocks its own reversal
 
 The Deny policy denies `ec2:StartInstances`, `rds:StartDBInstance`,
 `ecs:UpdateService`, and `autoscaling:UpdateAutoScalingGroup` — precisely the
@@ -125,12 +109,12 @@ and must wait for IAM propagation in between.** IAM is eventually consistent; an
 immediate retry can still fail. Poll a canary call until it succeeds rather than
 sleeping a fixed interval. Reversing this order breaks restore entirely.
 
-### 4.9 Restoring does not un-breach the budget
+### 4.8 Restoring does not un-breach the budget
 
 After a successful restore, the budget is still over threshold. The next refresh
 (within 8–12 hours) re-fires the Lambda, shuts everything down again, and
-re-attaches the Deny policy. The user experiences an unexplained second
-shutdown overnight.
+re-attaches the Deny policy. The user experiences an unexplained second shutdown
+overnight.
 
 **Consequence: `restore.sh` supports a bounded snooze** (§7.6). Without it the
 tool is actively hostile to the person it is meant to help.
@@ -146,7 +130,7 @@ Total budget (the ONE action-enabled budget)
   └─ 100% ACTUAL            ──► BudgetsAction: APPLY_IAM_POLICY
                                                           (block new launches)
 
-Per-service budgets ×5 (notification-only, free, condition-gated)
+Per-service budgets ×N (notification-only, free, one per SERVICE_BUDGETS entry)
   └─ 100% ACTUAL            ──► SNS ──► email + Lambda   (stop that service only)
 ```
 
@@ -154,32 +138,52 @@ Two independent halves fire from one threshold. The **native action** blocks
 future spend with no code. The **Lambda** stops present spend, covering AWS's
 gap. Both are fully reversible.
 
-## 6. Repository layout
+## 6. Deployment
 
-CDK (TypeScript) is the source of truth. `template.yaml` is its committed
-`cdk synth` output. CI verifies the two agree, so drift is impossible.
+CDK is the whole delivery mechanism. `cdk deploy` synthesizes a CloudFormation
+template from the TypeScript stack and hands it to CloudFormation, which creates
+the resources in the user's account. The synthesized template is a build
+artifact in `cdk.out/` and is **gitignored** — there is no hand-written
+CloudFormation file in the repo and none is committed.
+
+```bash
+git clone https://github.com/Njones27/AWS_Budget_Radar && cd AWS_Budget_Radar
+npm install
+cp .env.example .env        # edit: email, budget amount, deny targets
+npx cdk bootstrap           # once per account/region
+npx cdk deploy
+```
+
+`cdk bootstrap` is a one-time per-account/region step creating the `CDKToolkit`
+stack. Skipping it makes `cdk deploy` fail with an error that does not obviously
+say "run bootstrap." First-time CDK users trip on this constantly, so the README
+calls it out as its own numbered step rather than burying it in prose.
+
+Because configuration is read at synth time, `cdk deploy` after editing `.env`
+is also how you *change* settings — there is no separate update path.
+
+## 7. Components
+
+### 7.1 Repository layout
 
 ```
-bin/budget-radar.ts           CDK entrypoint
-lib/budget-radar-stack.ts     stack definition — source of truth
+bin/budget-radar.ts           CDK entrypoint; loads .env
+lib/budget-radar-stack.ts     stack definition
 lib/deny-policy.ts            the Deny policy document, isolated deliberately
+lib/config.ts                 .env parsing and validation
 lambda/handler.py             zero-dependency remediation handler
-template.yaml                 committed synth output — the no-Node deploy path
 .env.example                  the only file a member edits
-deploy.sh                     reads .env, runs aws cloudformation deploy
 restore.sh                    reverses everything
 test-fire.sh                  publishes a synthetic budget notification
 test/budget-radar.test.ts     CDK assertions (jest)
 tests/test_handler.py         handler logic (pytest, stubbed boto3)
-package.json  tsconfig.json  cdk.json
+package.json  tsconfig.json  cdk.json  .gitignore
 ```
 
-`lib/deny-policy.ts` is a separate file because it is the component most capable
-of harming a user (§8.2); it deserves isolated review and isolated tests.
+`lib/deny-policy.ts` is separate because it is the component most capable of
+harming a user (§7.3); it deserves isolated review and isolated tests.
 
-## 7. Components
-
-### 7.1 CDK stack resources
+### 7.2 Stack resources
 
 | Resource | Purpose |
 |---|---|
@@ -187,19 +191,22 @@ of harming a user (§8.2); it deserves isolated review and isolated tests.
 | `SNS::TopicPolicy` | Allows `budgets.amazonaws.com` to publish — **required**, a standard omission that silently breaks notifications |
 | `SNS::Subscription` | Email, from `ALERT_EMAIL` |
 | `Lambda::Function` | Python 3.13, 512 MB, 300 s timeout, `Code.fromAsset('lambda/')` |
-| `IAM::Role` (Lambda) | Describe + reversible-stop actions across the supported services |
+| `IAM::Role` (Lambda) | Describe + reversible-stop actions across supported services |
 | `IAM::ManagedPolicy` | The Deny policy. Created but **not attached**; the budget action attaches it |
 | `IAM::Role` (budget action) | Trusted by `budgets.amazonaws.com` with `aws:SourceArn` / `aws:SourceAccount` confused-deputy conditions |
 | `Budgets::Budget` (total) | Notifications at `WARN_AT_PERCENT` and 100% |
-| `Budgets::BudgetsAction` | `APPLY_IAM_POLICY`, `AUTOMATIC`, at 100% ACTUAL. Condition-gated on IAM targets being supplied |
-| `Budgets::Budget` ×5 | Per-service, notification-only, `SERVICE` cost filter, each condition-gated |
-| `SSM::Parameter` | Restore record (§7.4) |
+| `Budgets::BudgetsAction` | `APPLY_IAM_POLICY`, `AUTOMATIC`, at 100% ACTUAL. Created only if deny targets are configured |
+| `Budgets::Budget` ×N | One per `SERVICE_BUDGETS` entry, notification-only, `SERVICE` cost filter |
+| `SSM::Parameter` ×2 | Restore record (§7.5) and snooze timestamp (§7.6) |
 
 The Lambda's role needs `Resource: "*"` on describe/stop actions because targets
 are discovered at runtime. This is a genuinely broad role and the README must
 say so; it is inherent to the problem, not an oversight.
 
-### 7.2 The Deny policy
+The `lambda/` directory has **no dependencies** — boto3 ships in the Python
+Lambda runtime — so `Code.fromAsset` needs no bundling, no Docker, and no layer.
+
+### 7.3 The Deny policy
 
 **A positive list of spend-causing actions. Never `Deny: *`.**
 
@@ -213,16 +220,15 @@ Denies resource-creating actions: `ec2:RunInstances`, `ec2:StartInstances`,
 - All of `iam:*` — otherwise the user may be unable to detach this very policy
 - All of `budgets:*` — so the budget can be adjusted
 - All read-only actions (`Describe*`, `List*`, `Get*`) — so the console stays usable
-- `cloudformation:*` — so the stack can be updated or deleted
+- `cloudformation:*` — so the stack can be updated or destroyed
 
 A test asserts the synthesized policy does **not** deny `iam:DetachUserPolicy`.
 That single assertion is the difference between a safety tool and a lockout.
 
-### 7.3 The Lambda handler
+### 7.4 The Lambda handler
 
 0. **Check the snooze parameter** (§7.6). If snoozed and unexpired, publish
-   "snoozed until X — taking no action" to SNS and exit before doing anything
-   else.
+   "snoozed until X — taking no action" to SNS and exit before anything else.
 1. **Parse** the SNS budget notification to determine which budget fired. The
    payload is semi-structured; the handler must be defensive. If the budget name
    cannot be determined, fall back to a **full sweep** and log loudly.
@@ -232,77 +238,37 @@ That single assertion is the difference between a safety tool and a lockout.
 3. **Discover and filter.** Skip anything tagged `BudgetRadar:Protect=true`.
    Skip anything with no reversible off switch.
 4. **Act**, strictly in this order:
-   1. ASG → `UpdateAutoScalingGroup` min/desired = 0 — **before EC2** (§4.6)
+   1. ASG → `UpdateAutoScalingGroup` min/desired = 0 — **before EC2** (§4.5)
    2. EC2 → `StopInstances`
    3. Lambda → `PutFunctionConcurrency` reserved = 0
    4. ECS → `UpdateService` desiredCount = 0
    5. RDS → `StopDBInstance`
    6. SageMaker notebooks → `StopNotebookInstance`
-5. **Record and report.** Merge results into the SSM record (§7.4); publish a
+5. **Record and report.** Merge results into the SSM record (§7.5); publish a
    human-readable summary to SNS.
 
 **Never touched, always reported** under "still costing you money — needs your
-decision": EMR clusters, SageMaker endpoints, NAT Gateways, unattached EIPs,
-S3 storage, and stopped-instance EBS volumes. The tool refuses to let ongoing
-costs be invisible, but will not delete to stop them.
+decision": EMR clusters, SageMaker endpoints, NAT Gateways, unattached EIPs, S3
+storage, and stopped-instance EBS volumes. The tool refuses to let ongoing costs
+be invisible, but will not delete to stop them.
 
 **Idempotency.** The budget stays breached and will re-notify up to three times
 daily. The handler must be safe to run repeatedly: stopping an already-stopped
 resource is a swallowed no-op.
 
-### 7.4 Restore record
+### 7.5 Restore record
 
 A single SSM Parameter holds JSON describing every change, keyed by budget
 period.
 
-**The second run must not erase the first run's record.** Writes **merge**;
-they never replace. A naive replace would leave `restore.sh` with an empty
-record after the second notification — the exact moment the user needs it. This
-is the subtlest failure mode in the design.
-
-`restore.sh` consumes this record; its operation is specified in §7.6.
+**The second run must not erase the first run's record.** Writes **merge**; they
+never replace. A naive replace would leave `restore.sh` with an empty record
+after the second notification — the exact moment the user needs it. This is the
+subtlest failure mode in the design.
 
 If the record is missing or empty (the Lambda only ever ran in dry-run, or never
 fired), `restore.sh` still detaches the Deny policy and reports that there was
 nothing recorded to restart. It must not error out.
-
-### 7.5 Configuration
-
-`.env.example` is the entire configuration surface. Each maps to a
-CloudFormation Parameter (§4.4).
-
-```bash
-ALERT_EMAIL=you@uky.edu
-MONTHLY_BUDGET_USD=50            # 0.01 gives a zero-spend tripwire
-WARN_AT_PERCENT=80
-DRY_RUN=true                     # report only; flip to false to arm
-
-# Who the Deny policy attaches to. Cannot restrain root (§4.3).
-IAM_DENY_TARGET_USERS=
-IAM_DENY_TARGET_GROUPS=
-IAM_DENY_TARGET_ROLES=
-
-# Up to 5. Names must match AWS service strings exactly (§4.5).
-SERVICE_1_NAME=Amazon Elastic Compute Cloud - Compute
-SERVICE_1_LIMIT=20
-# SERVICE_2_NAME=Amazon SageMaker
-# SERVICE_2_LIMIT=10
-
-PROTECTED_TAG_KEY=BudgetRadar:Protect
-```
-
-The stack creates the budget itself rather than assuming a pre-existing one;
-clone-and-deploy must be self-contained. `MONTHLY_BUDGET_USD=0.01` yields the
-zero-spend variant for members who should never leave the free tier.
-
-`deploy.sh` must reject a configuration that names the Lambda's own execution
-role among the Deny targets. Doing so would leave the remediation half
-permission-denied at exactly the moment it is needed, and the failure would
-appear only in CloudWatch logs nobody is reading.
-
-If all three `IAM_DENY_TARGET_*` are empty, the budget action is not created.
-The stack still deploys and the Lambda half still works; `deploy.sh` warns
-loudly that future-launch blocking is disabled.
 
 ### 7.6 `restore.sh`
 
@@ -312,15 +278,14 @@ Run from the repo root with the credentials used to deploy:
 ./restore.sh [--snooze HOURS]
 ```
 
-Ordering is mandatory and derives from §4.8:
+Ordering is mandatory and derives from §4.7:
 
 1. **Detach the Deny policy** from every configured target.
-2. **Wait for IAM propagation** — poll a canary call (e.g. `DescribeInstances`
-   followed by a dry-run `StartInstances`) until it is permitted. Do not sleep a
-   fixed interval.
+2. **Wait for IAM propagation** — poll a canary call (e.g. a dry-run
+   `StartInstances`) until it is permitted. Do not sleep a fixed interval.
 3. **Restart from the SSM record** — start instances, restore Lambda reserved
-   concurrency, scale ASGs and ECS services back to their recorded values, start
-   RDS instances, start SageMaker notebooks.
+   concurrency, scale ASGs and ECS services back to recorded values, start RDS
+   instances, start SageMaker notebooks.
 4. **Apply the snooze** if `--snooze` was given: write a snooze-until timestamp
    to SSM. **Capped at 72 hours**, so protection cannot be disabled for a whole
    budget period by accident.
@@ -333,20 +298,61 @@ The shutdown notification email must include the literal `./restore.sh` command,
 so recovery never requires hunting for documentation.
 
 **Total lockout escape hatch.** If a user has somehow lost the ability to detach
-the policy, the documented recovery is to sign in as the root user and detach it
-in the IAM console. §7.2 is designed so this should never be necessary; the
-README documents it anyway.
+the policy, the documented recovery is to sign in as root and detach it in the
+IAM console. §7.3 is designed so this should never be necessary; the README
+documents it anyway.
+
+### 7.7 Configuration
+
+`.env` is the entire configuration surface, read at synth time by
+`lib/config.ts` and validated before any construct is created.
+
+```bash
+ALERT_EMAIL=you@uky.edu
+MONTHLY_BUDGET_USD=50            # 0.01 gives a zero-spend tripwire
+WARN_AT_PERCENT=80
+DRY_RUN=true                     # report only; flip to false to arm
+
+# Who the Deny policy attaches to. Cannot restrain root (§4.3).
+IAM_DENY_TARGET_USERS=
+IAM_DENY_TARGET_GROUPS=
+IAM_DENY_TARGET_ROLES=
+
+# Any number of entries. Names must match AWS service strings exactly (§4.4).
+SERVICE_BUDGETS=Amazon Elastic Compute Cloud - Compute:20,Amazon SageMaker:10
+
+PROTECTED_TAG_KEY=BudgetRadar:Protect
+```
+
+The stack creates the budget itself rather than assuming a pre-existing one;
+clone-and-deploy must be self-contained. `MONTHLY_BUDGET_USD=0.01` yields the
+zero-spend variant for members who should never leave the free tier.
+
+**Validation in `lib/config.ts`, failing synth with an actionable message:**
+
+- `ALERT_EMAIL` present and syntactically valid
+- `MONTHLY_BUDGET_USD` numeric and > 0
+- `WARN_AT_PERCENT` between 1 and 99
+- The Lambda's own execution role is **not** among the deny targets — that would
+  leave remediation permission-denied at exactly the moment it is needed, and
+  the failure would surface only in CloudWatch logs nobody is reading
+- If all three `IAM_DENY_TARGET_*` are empty: warn loudly that future-launch
+  blocking is disabled, skip the `BudgetsAction`, and continue. The Lambda half
+  still works.
+
+Failing at synth is deliberate: a misconfiguration should never reach the
+account.
 
 ## 8. Safety
 
 1. **`DRY_RUN=true` by default.** First deployment reports what it *would* stop.
    A tool that shuts down infrastructure earns trust before it acts.
-2. **Positive-list Deny policy** (§7.2), with a test against self-lockout.
+2. **Positive-list Deny policy** (§7.3), with a test against self-lockout.
 3. **`BudgetRadar:Protect=true`** exempts any resource.
 4. **`restore.sh`** reverses everything in one command, in an order that works
-   while the Deny policy is attached (§4.8).
+   while the Deny policy is attached (§4.7).
 5. **Bounded snooze**, capped at 72 hours, so recovery does not become permanent
-   disarmament (§4.9).
+   disarmament (§4.8).
 6. **Reversible actions only.** No code path deletes or terminates anything.
 
 ## 9. Testing
@@ -355,29 +361,28 @@ The trigger cannot be fired on demand, so testing is layered:
 
 - **`tests/test_handler.py`** (pytest, stubbed boto3) — ordering (ASG before
   EC2), protect-tag exemption, dry-run performs no mutating calls, idempotency,
-  SSM merge-not-replace, malformed-notification fallback.
+  SSM merge-not-replace, malformed-notification fallback, no-op while snoozed.
 - **`test/budget-radar.test.ts`** (jest + CDK assertions) — SNS topic policy
   permits `budgets.amazonaws.com`; exactly one action-enabled budget exists;
   budget action role carries confused-deputy conditions; **the Deny policy does
-  not deny `iam:*`**; service budget slots are condition-gated.
+  not deny `iam:*`**; N service budgets are created from N config entries;
+  config validation rejects bad input.
 - **`restore.sh` coverage** — an integration check that restore succeeds *while
-  the Deny policy is attached* (§4.8). This is the regression most likely to be
+  the Deny policy is attached* (§4.7). This is the regression most likely to be
   reintroduced, because the correct ordering looks arbitrary from the outside.
-  Plus: snooze cap enforced at 72 h; empty SSM record exits cleanly; Lambda
-  no-ops while a snooze is live.
+  Plus: snooze cap enforced at 72 h; empty SSM record exits cleanly.
 - **`test-fire.sh`** — publishes a realistic synthetic budget notification to the
   live SNS topic, exercising the deployed Lambda end to end.
-- **CI** — asserts committed `template.yaml` matches fresh `cdk synth` output.
 
 ## 10. Cost
 
 | Item | Cost |
 |---|---|
 | Total budget (action-enabled) | Free — 1 of 2 free |
-| Per-service budgets ×5 | Free — no actions attached |
+| Per-service budgets ×N | Free — no actions attached |
 | Lambda | Free tier; runs only on notification |
 | SNS email | Free tier |
-| SSM Parameter (Standard) | Free |
+| SSM Parameters (Standard) | Free |
 | **Total** | **$0** |
 
 ## 11. Future work
