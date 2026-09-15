@@ -87,7 +87,8 @@ export class BudgetRadarStack extends cdk.Stack {
         "sagemaker:ListNotebookInstances", "sagemaker:ListEndpoints",
         "cloudwatch:GetMetricData",
         "elasticloadbalancing:DescribeLoadBalancers",
-        "budgets:DescribeBudgetAction"
+        "budgets:DescribeBudgetAction",
+        "s3:ListAllMyBuckets"
       ],
       resources: ["*"]  // targets are discovered at runtime; all actions are read-only
     }));

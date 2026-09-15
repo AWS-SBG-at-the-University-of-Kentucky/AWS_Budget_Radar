@@ -235,12 +235,106 @@ def _from_trigger_topic(event):
     return False
 
 
+# --- Report assembly, S3 sizing, byte budget, publish (Task 9) ---
+
+SNS_MAX_BYTES = 262144
+
+
+def s3_bucket_sizes():
+    """S3 sizes from daily CloudWatch BucketSizeBytes. Never enumerate objects."""
+    try:
+        s3 = _client("s3")
+        buckets = s3.list_buckets().get("Buckets", [])
+    except Exception as e:  # denied/unavailable -> unknown, never silent 0/omission
+        return [f"S3 bucket sizing unavailable: {e}"]
+    cw = _client("cloudwatch", "us-east-1")
+    lines = []
+    for b in buckets:
+        name = b["Name"]
+        try:
+            resp = cw.get_metric_data(MetricDataQueries=[{
+                "Id": "size",
+                "MetricStat": {
+                    "Metric": {"Namespace": "AWS/S3", "MetricName": "BucketSizeBytes",
+                               "Dimensions": [{"Name": "BucketName", "Value": name},
+                                              {"Name": "StorageType", "Value": "StandardStorage"}]},
+                    "Period": 86400, "Stat": "Average"}
+            }], StartTime=dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=2),
+               EndTime=dt.datetime.now(dt.timezone.utc))
+            vals = resp["MetricDataResults"][0].get("Values", [])
+            ts = resp["MetricDataResults"][0].get("Timestamps", [])
+            if vals:
+                lines.append(f"s3://{name}: {int(vals[0])} bytes (as of {ts[0] if ts else '?'})")
+            else:
+                lines.append(f"s3://{name}: size unknown (no recent CloudWatch metric)")
+        except Exception as e:  # denied/throttled -> unknown, never silent 0
+            lines.append(f"s3://{name}: size unknown ({e})")
+    return lines
+
+
+def _fit(body, limit=SNS_MAX_BYTES):
+    """Enforce the SNS byte budget. Never silently truncate into a completeness claim:
+    if we have to cut, say so explicitly."""
+    data = body.encode("utf-8")
+    if len(data) <= limit:
+        return body
+    notice = ("\n\n[... report truncated/omitted to fit the 256 KB SNS message limit; "
+               "this is NOT the full inventory — see CloudWatch Logs for the complete report ...]")
+    keep = limit - len(notice.encode("utf-8"))
+    return data[:keep].decode("utf-8", "ignore") + notice
+
+
+def build_report(status, status_ts, inv, safety):
+    lines = []
+    lines.append("AWS Budget Radar - budget threshold reached.")
+    lines.append(f"Budget action status (observed via AWS Budgets): {status} at {status_ts}.")
+    lines.append(f"Safety mode: {safety} (watch=deny pending your approval; armed=deny auto-applied).")
+    lines.append("")
+    lines.append("IMPORTANT: Workloads that are already running KEEP running until you stop them yourself.")
+    lines.append("This report does not stop anything - it only observes and informs.")
+    lines.append("This is a best-effort inventory with explicit coverage gaps, not a complete bill or a")
+    lines.append("guarantee that every costing resource is listed below.")
+    lines.append("")
+    lines.append(f"Inventory generated: {inv.get('generated', status_ts)}")
+    lines.append("")
+    for area in inv["areas"]:
+        head = f"[{area['state'].upper()}] {area['service']} @ {area['region']}"
+        if area["state"] == FAILED:
+            head += f" - {area.get('error', '')}"
+        lines.append(head)
+        for it in area["items"]:
+            lines.append(f"    - {it}")
+    lines.append("")
+    lines.append("Still costing you money (investigate):")
+    for s in s3_bucket_sizes():
+        lines.append(f"    - {s}")
+    lines.append("")
+    lines.append("To lift the block: reverse the budget action in the console (admin route), "
+                  "or it clears automatically at the next budget period.")
+    return _fit("\n".join(lines))
+
+
+def publish(topic_arn, subject, body):
+    """Publish the report. MUST NOT swallow errors: a failed publish must raise so the
+    async Lambda invocation is marked failed, retries fire, and exhausted retries land
+    on the on-failure destination (the dead-letter queue)."""
+    _client("sns").publish(TopicArn=topic_arn, Subject=subject[:100], Message=body)
+
+
 def handler(event, context):
     if not _from_trigger_topic(event):
         print("Event not from TriggerTopic; ignoring.")
         return {"status": "ignored"}
-    regions = enabled_regions()
-    deadline = time.time() + 780  # leave headroom under the 900s Lambda timeout for the report publish (Task 9)
-    inventory(regions, deadline)
-    # Report rendering + SNS publish added in Task 9.
-    return {"status": "ok"}
+
+    account_id = os.environ["ACCOUNT_ID"]
+    budget_name = os.environ["BUDGET_NAME"]
+    action_id = os.environ["ACTION_ID"]
+    report_topic = os.environ["REPORT_TOPIC_ARN"]
+    safety = os.environ.get("SAFETY", "watch")
+
+    status, status_ts = observe_action_status(account_id, budget_name, action_id)
+    deadline = time.time() + 780  # leave headroom under the 900s Lambda timeout for the report publish
+    inv = inventory(enabled_regions(), deadline_epoch=deadline)
+    body = build_report(status, status_ts, inv, safety)
+    publish(report_topic, "AWS Budget Radar: budget threshold reached", body)  # raises on failure
+    return {"status": "reported", "action_status": status}

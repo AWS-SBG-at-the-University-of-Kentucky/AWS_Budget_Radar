@@ -53,7 +53,11 @@ def test_from_trigger_topic_false_when_unset(monkeypatch):
 
 def test_handler_calls_enabled_regions_and_inventory_when_triggered(monkeypatch):
     monkeypatch.setenv("TRIGGER_TOPIC_ARN", "arn:aws:sns:us-east-1:111122223333:Trigger")
-    called = {"enabled_regions": False, "inventory": False}
+    monkeypatch.setenv("ACCOUNT_ID", "111122223333")
+    monkeypatch.setenv("BUDGET_NAME", "b")
+    monkeypatch.setenv("ACTION_ID", "11111111-1111-1111-1111-111111111111")
+    monkeypatch.setenv("REPORT_TOPIC_ARN", "arn:aws:sns:us-east-1:111122223333:Report")
+    called = {"enabled_regions": False, "inventory": False, "publish": False}
 
     def fake_enabled_regions():
         called["enabled_regions"] = True
@@ -64,13 +68,24 @@ def test_handler_calls_enabled_regions_and_inventory_when_triggered(monkeypatch)
         assert regions == ["us-east-1"]
         return {"areas": [], "generated": "2024-01-01T00:00:00+00:00"}
 
+    def fake_observe_action_status(account_id, budget_name, action_id):
+        return "EXECUTION_SUCCESS", "2024-01-01T00:00:00+00:00"
+
+    def fake_publish(topic_arn, subject, body):
+        called["publish"] = True
+
     monkeypatch.setattr(handler, "enabled_regions", fake_enabled_regions)
     monkeypatch.setattr(handler, "inventory", fake_inventory)
+    monkeypatch.setattr(handler, "observe_action_status", fake_observe_action_status)
+    monkeypatch.setattr(handler, "s3_bucket_sizes", lambda: [])
+    monkeypatch.setattr(handler, "publish", fake_publish)
     event = {"Records": [{"Sns": {"TopicArn": "arn:aws:sns:us-east-1:111122223333:Trigger", "Message": "x"}}]}
     result = handler.handler(event, None)
-    assert result["status"] == "ok"
+    assert result["status"] == "reported"
+    assert result["action_status"] == "EXECUTION_SUCCESS"
     assert called["enabled_regions"] is True
     assert called["inventory"] is True
+    assert called["publish"] is True
 
 
 # --- Task 8: region enumeration + inventory coverage-state framework ---
@@ -362,3 +377,41 @@ def test_adapters_registry_has_every_expected_service():
         "eips-unattached", "load-balancers",
         "ebs-volumes", "nat-gateways",
     }
+
+
+# --- Task 9: report assembly, byte budget, publish-failure semantics ---
+
+def test_report_states_observed_status_and_running_reminder():
+    inv = {"areas": [{"region": "us-east-1", "service": "ec2-instances", "state": "complete",
+                      "items": ["i-1 t3.micro in us-east-1"]}], "generated": "2026-09-15T00:00:00+00:00"}
+    body = handler.build_report("EXECUTION_SUCCESS", "2026-09-15T00:00:00+00:00", inv, "armed")
+    assert "EXECUTION_SUCCESS" in body
+    assert "still running" in body.lower() or "keep running" in body.lower()
+    assert "i-1 t3.micro" in body
+
+
+def test_fit_truncates_with_disclosure_over_limit():
+    huge = "x\n" * 200000
+    fitted = handler._fit(huge, limit=1000)
+    assert len(fitted.encode("utf-8")) <= 1000
+    assert "omitted" in fitted.lower() or "truncated" in fitted.lower()
+
+
+def test_publish_failure_propagates(monkeypatch):
+    class FailingSns:
+        def publish(self, **kw): raise RuntimeError("SNS down")
+    monkeypatch.setattr(handler, "_client", lambda svc, region=None: FailingSns())
+    import pytest
+    with pytest.raises(RuntimeError):
+        handler.publish("arn:aws:sns:us-east-1:111122223333:Report", "subj", "body")
+
+
+def test_s3_sizes_unknown_when_no_metric(monkeypatch):
+    class CW:
+        def get_metric_data(self, **kw): return {"MetricDataResults": [{"Values": [], "Timestamps": []}]}
+        def list_buckets(self, **kw): return {"Buckets": [{"Name": "b1"}]}
+    def fake_client(svc, region=None):
+        return CW()
+    monkeypatch.setattr(handler, "_client", fake_client)
+    lines = handler.s3_bucket_sizes()
+    assert any("unknown" in l.lower() for l in lines)
