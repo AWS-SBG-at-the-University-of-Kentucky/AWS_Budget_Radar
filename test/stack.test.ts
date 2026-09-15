@@ -122,3 +122,42 @@ test("action role attach/detach statement is scoped to the DenyNewSpend policy A
     })
   }));
 });
+
+test("Path B creates a monthly USD cost budget and one action", () => {
+  const t = synth(cfg);
+  t.hasResourceProperties("AWS::Budgets::Budget", Match.objectLike({
+    Budget: Match.objectLike({ BudgetType: "COST", TimeUnit: "MONTHLY", BudgetLimit: { Amount: 5, Unit: "USD" } })
+  }));
+  t.resourceCountIs("AWS::Budgets::BudgetsAction", 1);
+});
+
+test("Path A creates the action but NO budget", () => {
+  const t = synth({ ...cfg, existingBudgetName: "MyBudget" });
+  t.resourceCountIs("AWS::Budgets::Budget", 0);
+  t.hasResourceProperties("AWS::Budgets::BudgetsAction", Match.objectLike({ BudgetName: "MyBudget" }));
+});
+
+test("watch => MANUAL, armed => AUTOMATIC", () => {
+  expect(Object.values(synth(cfg).findResources("AWS::Budgets::BudgetsAction"))[0].Properties.ApprovalModel).toBe("MANUAL");
+  expect(Object.values(synth({ ...cfg, safety: "armed" }).findResources("AWS::Budgets::BudgetsAction"))[0].Properties.ApprovalModel).toBe("AUTOMATIC");
+});
+
+test("action targets the configured identities and publishes to the trigger topic", () => {
+  const t = synth(cfg);
+  const action = Object.values(t.findResources("AWS::Budgets::BudgetsAction"))[0].Properties;
+  expect(action.ActionType).toBe("APPLY_IAM_POLICY");
+  expect(action.Definition.IamActionDefinition.Users).toEqual(["student"]);
+  expect(action.Subscribers).toEqual(expect.arrayContaining([
+    expect.objectContaining({ Type: "SNS" })
+  ]));
+});
+
+test("reporter receives account/budget/action env identifiers", () => {
+  const t = synth(cfg);
+  const fn = Object.values(t.findResources("AWS::Lambda::Function"))[0].Properties;
+  expect(fn.Environment.Variables).toEqual(expect.objectContaining({
+    ACCOUNT_ID: expect.anything(),
+    BUDGET_NAME: expect.anything(),
+    ACTION_ID: expect.anything()
+  }));
+});

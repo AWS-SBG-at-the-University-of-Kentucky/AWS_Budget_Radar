@@ -70,7 +70,8 @@ export class BudgetRadarStack extends cdk.Stack {
         REPORT_TOPIC_ARN: this.reportTopic.topicArn,
         TRIGGER_TOPIC_ARN: this.triggerTopic.topicArn,
         SAFETY: config.safety
-        // ACCOUNT_ID / BUDGET_NAME / ACTION_ID are added in Task 5.
+        // ACCOUNT_ID / BUDGET_NAME / ACTION_ID are added below, once the
+        // budget and action exist.
       }
     });
     this.reportTopic.grantPublish(this.reporter);
@@ -118,6 +119,68 @@ export class BudgetRadarStack extends cdk.Stack {
         ArnEquals: { "iam:PolicyARN": this.denyPolicy.managedPolicyArn }
       }
     }));
+
+    // --- Determine the budget name and (Path B) create the budget. ---
+    const budgetName = config.existingBudgetName ?? `budget-radar-${cdk.Names.uniqueId(this).slice(-8)}`;
+
+    if (!config.existingBudgetName) {
+      const notifications = [
+        // warn-only threshold -> report topic (email); does NOT trigger the Lambda
+        {
+          notification: { notificationType: "ACTUAL", comparisonOperator: "GREATER_THAN", threshold: config.warnAtPercent },
+          subscribers: [{ subscriptionType: "SNS", address: this.reportTopic.topicArn }]
+        }
+      ];
+      new cdk.aws_budgets.CfnBudget(this, "Budget", {
+        budget: {
+          budgetName,
+          budgetType: "COST",
+          timeUnit: "MONTHLY",
+          budgetLimit: { amount: config.monthlyBudgetUsd, unit: "USD" }
+        },
+        notificationsWithSubscribers: notifications
+      });
+    }
+
+    const action = new cdk.aws_budgets.CfnBudgetsAction(this, "BlockNewSpend", {
+      budgetName,
+      actionThreshold: { type: "PERCENTAGE", value: config.actionThresholdPercent },
+      actionType: "APPLY_IAM_POLICY",
+      approvalModel: config.safety === "armed" ? "AUTOMATIC" : "MANUAL",
+      notificationType: config.actionThresholdType,
+      executionRoleArn: this.actionRole.roleArn,
+      definition: {
+        iamActionDefinition: {
+          policyArn: this.denyPolicy.managedPolicyArn,
+          users: config.denyTargetUsers.length ? config.denyTargetUsers : undefined,
+          groups: config.denyTargetGroups.length ? config.denyTargetGroups : undefined,
+          roles: config.denyTargetRoles.length ? config.denyTargetRoles : undefined
+        }
+      },
+      subscribers: [{ type: "SNS", address: this.triggerTopic.topicArn }]
+    });
+
+    // Give the reporter the identifiers it needs for DescribeBudgetAction.
+    this.reporter.addEnvironment("ACCOUNT_ID", account);
+    this.reporter.addEnvironment("BUDGET_NAME", budgetName);
+    this.reporter.addEnvironment("ACTION_ID", action.attrActionId);
+
+    // --- Optional per-service warn budgets (notification-only, free). ---
+    for (const [i, sb] of config.serviceBudgets.entries()) {
+      new cdk.aws_budgets.CfnBudget(this, `ServiceBudget${i}`, {
+        budget: {
+          budgetName: `${budgetName}-svc-${i}`,
+          budgetType: "COST",
+          timeUnit: "MONTHLY",
+          budgetLimit: { amount: sb.limitUsd, unit: "USD" },
+          costFilters: { Service: [sb.service] }
+        },
+        notificationsWithSubscribers: [{
+          notification: { notificationType: "ACTUAL", comparisonOperator: "GREATER_THAN", threshold: 100 },
+          subscribers: [{ subscriptionType: "SNS", address: this.reportTopic.topicArn }]
+        }]
+      });
+    }
   }
 
   private denyTargetArns(config: RadarConfig, account: string): string[] {
