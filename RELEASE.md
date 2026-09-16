@@ -122,7 +122,7 @@ under both `SAFETY=watch` (pending) and `SAFETY=armed` (executed).
   - **restart a previously-stopped RDS instance** (`rds:StartDBInstance`).
 
   This is the check that proves the deliberate start-blocking side effect
-  documented in README §1 ("a targeted identity cannot restart its own
+  documented in README Part 6 ("a blocked identity cannot restart its own
   stopped EC2/RDS instances while the block is active") is genuinely
   recoverable, not just theoretically reversible. Do not skip this — it is
   a required release item, not an optional nice-to-have.
@@ -137,10 +137,10 @@ Run `npx cdk destroy`:
 
 For each, record whether `cdk destroy` detaches and deletes the IAM policy
 cleanly on its own, or requires reversing the budget action first (a managed
-policy cannot be deleted while attached). Update spec / README §8 with
+policy cannot be deleted while attached). Update spec / README Part 5 with
 the observed behavior — do not leave this as an assumption.
 
-Specifically record (README §8 already documents the expected mechanism —
+Specifically record (README Part 5 already documents the expected mechanism —
 confirm it against a real account): with the action in `EXECUTION_SUCCESS`
 (deny attached) and the `BudgetsAction` resource **deleted first** (the
 order `cdk destroy` actually uses), does the deny policy remain attached to
@@ -149,7 +149,7 @@ itself detach anything), does the subsequent `DeleteManagedPolicy` call for
 `DenyNewSpend` fail because it's still attached (expected: yes), does the
 CloudFormation stack land in `DELETE_FAILED` as a result (expected: yes),
 and does the manual fallback (`aws iam detach-user-policy` / `detach-group-
-policy` / `detach-role-policy`, per README §8) actually free the identity
+policy` / `detach-role-policy`, per README Part 5) actually free the identity
 and allow a `cdk destroy` retry to complete.
 
 ### 9. Capture artifacts
@@ -166,7 +166,7 @@ budget check, and `npm run verify` — each requires a real account to
 confirm, not just unit coverage.
 
 1. **Billing-console gate, on and off.** As an IAM user with Billing IAM
-   access **NOT** activated (the AWS default — see README §2), attempt to
+   access **NOT** activated (the AWS default — see README 1.2), attempt to
    approve a `PENDING` action and to reverse an `EXECUTION_SUCCESS` action
    via the **Budgets console**; confirm it fails (access denied / blank
    page) as documented. Record the exact failure. Then confirm the
@@ -191,7 +191,7 @@ confirm, not just unit coverage.
    identity and let a retried `cdk destroy` complete.
 4. **Time-to-deny on an already-breached budget.** Deploy `SAFETY=armed`
    against a budget that is already at/over the action threshold (the
-   scenario the preflight now warns/fails on — see README §6/§9 and
+   scenario the preflight now warns/fails on — see README Parts 3-4 and
    preflight's already-breached-budget check). Record the observed time from stack creation to
    the deny actually taking effect (`EXECUTION_SUCCESS`).
 5. **If the Lambda never runs on a real breach**, check the trigger topic's
@@ -205,7 +205,7 @@ confirm, not just unit coverage.
    `cdk deploy`/`cdk destroy` (the deny never includes IAM/CloudFormation
    actions); (b) it can still stop/terminate EC2, RDS, and scale ECS/ASG to
    zero (the deny is a positive list of create/start actions only — see
-   README §10); (c) the recovery principal can actually be assumed/accessed
+   README Part 6); (c) the recovery principal can actually be assumed/accessed
    in practice, not just resolved in IAM (the preflight only ever proves
    the latter).
 7. **Attempt the F6(b) additions under the block.** Confirm
