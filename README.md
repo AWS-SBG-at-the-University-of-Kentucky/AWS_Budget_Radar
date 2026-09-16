@@ -104,6 +104,10 @@ See the comments in `.env.example` for every field.
 
 ## 4. One-time bootstrap
 
+> `cdk bootstrap` synthesizes the app first, so do §3 (fill in `.env`)
+> before this step. If you want to bootstrap before `.env` exists, run it
+> app-independent: `npx cdk bootstrap --app "" aws://<account-id>/<region>`.
+
 ```bash
 npx cdk bootstrap
 ```
