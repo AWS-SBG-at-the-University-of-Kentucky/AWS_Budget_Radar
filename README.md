@@ -79,6 +79,11 @@ Needed once per AWS account/region. `cdk deploy` fails without it.
 
 ## 5. Deploy
 
+> **Before you deploy: read [`RELEASE.md`](./RELEASE.md).** This project has
+> passing unit tests but has **not yet completed live-account validation** —
+> `RELEASE.md` tracks that outstanding status and the authorization boundary
+> for running it against a real (disposable) AWS account.
+
 ```bash
 npm run deploy
 ```
