@@ -46,10 +46,13 @@ your recovery/admin principal separate from it.
   never applies to *you* and Budget Radar protects nothing. Before you
   continue:
   1. Sign in as root (or your admin) and open **IAM → Users → Create user**
-     (for example `learning`). Attach the permissions you actually use for
-     coursework (e.g. `PowerUserAccess`). Turn on console access and/or
-     create an access key for the CLI only if you need them — do that
-     yourself and keep the credentials private.
+     (for example `learning`). On the permissions step choose **Attach
+     policies directly** and attach **`AdministratorAccess`** — that's the
+     simplest option and it's what the club uses. Console access and access
+     keys are optional; turn them on only if you need them, and keep the
+     credentials private. (Because the user is an admin it *could* detach
+     the deny policy itself — the block is accident-prevention for your own
+     spending, not a security boundary against you.)
   2. From now on, do your normal AWS work **as that user** (console and
      `aws configure`). Radar can't check this for you — an identity you
      don't actually use is an identity that isn't protected.
