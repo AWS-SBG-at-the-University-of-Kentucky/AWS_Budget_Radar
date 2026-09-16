@@ -512,6 +512,54 @@ def _safety_label(safety):
     return "automatic approval configured" if safety == "armed" else "manual approval configured"
 
 
+# --- F1: concrete CLI recovery commands. AWS's Billing/Budgets console pages
+# are gated behind an account-root opt-in ("IAM user and role access to
+# Billing information") that is OFF by default -- an IAM user/role can be
+# fully authorized and still see nothing but an access-denied page there.
+# The Budgets API has no such console-visibility gate, so these commands
+# work regardless of whether that root setting has been enabled. Built
+# straight from the env vars the reporter already has (ACCOUNT_ID/
+# BUDGET_NAME/ACTION_ID), matching the same identifiers DescribeBudgetAction
+# was just called with, never fabricated.
+
+def _execute_budget_action_cli(account_id, budget_name, action_id, execution_type):
+    return (f"aws budgets execute-budget-action --account-id {account_id} "
+            f"--budget-name {budget_name} --action-id {action_id} "
+            f"--execution-type {execution_type}")
+
+
+def _reverse_cli(account_id, budget_name, action_id):
+    """Lifts an already-applied deny (EXECUTION_SUCCESS -> reversed)."""
+    return _execute_budget_action_cli(account_id, budget_name, action_id, "REVERSE_BUDGET_ACTION")
+
+
+def _approve_cli(account_id, budget_name, action_id):
+    """Approves a PENDING action under SAFETY=watch (applies the deny now)."""
+    return _execute_budget_action_cli(account_id, budget_name, action_id, "APPROVE_BUDGET_ACTION")
+
+
+def _call_to_action(status, account_id, budget_name, action_id):
+    """F4: the report's call-to-action is conditional on the OBSERVED status
+    -- never claim "to lift the block" when nothing is applied, and never
+    stay silent about how to approve a PENDING action under watch mode."""
+    if not (account_id and budget_name and action_id):
+        return ("Call to action unavailable (account/budget/action identifiers missing); check the AWS Budgets "
+                "console directly for the current action state.")
+    approve_cli = _approve_cli(account_id, budget_name, action_id)
+    reverse_cli = _reverse_cli(account_id, budget_name, action_id)
+    if status == "PENDING":
+        return ("NOTHING IS BLOCKED YET. If you want the block applied now (SAFETY=watch is waiting on your "
+                f"approval), approve it by running:\n    {approve_cli}\n"
+                "(or use the AWS Budgets console -- note the console page requires the account root to have "
+                "enabled \"IAM user and role access to Billing information\"; the CLI above works regardless).")
+    if status == "EXECUTION_SUCCESS":
+        return f"The block is applied. To lift it, run:\n    {reverse_cli}"
+    if status in ("REVERSE_SUCCESS", "STANDBY"):
+        return "No block is in effect."
+    return ("Status does not map to a specific call to action; check the AWS Budgets console directly for the "
+            "current action state (or run the AWS CLI's budgets describe-budget-action).")
+
+
 _STATUS_NARRATIVE = {
     # Keys are the real DescribeBudgetAction ActionStatus enum values.
     "STANDBY": "the action is on standby and has not been applied.",
@@ -566,6 +614,24 @@ def _format_targets(action_details):
     return ", ".join(action_details["targets"])
 
 
+def _status_headline(status):
+    """F3: subject/headline derived from the OBSERVED status -- the action
+    also notifies on reverse/reset/standby, not just a threshold breach, so
+    a constant "budget threshold reached" wording for every run is
+    misleading for those events."""
+    if status == "PENDING" or status.startswith("EXECUTION_"):
+        return f"budget threshold reached — action {status}"
+    if status.startswith("REVERSE_") or status.startswith("RESET_") or status == "STANDBY":
+        return f"budget action status changed: {status}"
+    if status == "UNKNOWN":
+        return "budget action notification (status unknown)"
+    return f"budget action notification (status unknown): {status}"
+
+
+def _report_subject(status):
+    return f"AWS Budget Radar: {_status_headline(status)}"
+
+
 def _budgets_console_url(account_id, budget_name):
     if not budget_name:
         return "https://console.aws.amazon.com/billing/home#/budgets (budget name unknown)"
@@ -573,17 +639,30 @@ def _budgets_console_url(account_id, budget_name):
 
 
 def build_report(status, status_ts, inv, safety, account_id=None, budget_name=None,
-                  action_details=None, deadline_epoch=None):
+                  action_details=None, deadline_epoch=None, action_id=None,
+                  recovery_principal_arn=None):
     lines = []
-    lines.append("AWS Budget Radar - budget threshold reached.")
+    lines.append(f"AWS Budget Radar - {_status_headline(status)}.")
     lines.append("")
     lines.append(f"AWS account: {account_id or 'unknown'}")
     lines.append(f"Budget: {budget_name or 'unknown'}")
     lines.append(f"Action threshold: {_format_threshold(action_details)}")
     lines.append(f"Covered identities (deny targets): {_format_targets(action_details)}")
     lines.append(f"View/manage in the AWS Budgets console: {_budgets_console_url(account_id, budget_name)}")
-    lines.append("To reverse the action: assume the RECOVERY_PRINCIPAL_ARN principal configured at "
-                  "deploy time (see README) and detach the deny policy, or use the console link above.")
+    lines.append("NOTE: the Budgets/Billing console pages above only work for an IAM user/role once the account "
+                  "root has enabled \"IAM user and role access to Billing information\" (off by default) -- the "
+                  "AWS CLI commands below work regardless of that setting.")
+    # F1(c): name the actual configured recovery principal instead of the
+    # generic "RECOVERY_PRINCIPAL_ARN... see README" wording, when known.
+    recovery_who = recovery_principal_arn or (
+        "the recovery principal configured at deploy time (RECOVERY_PRINCIPAL_ARN; see README)"
+    )
+    if account_id and budget_name and action_id:
+        lines.append(f"To reverse the action: assume {recovery_who} and detach the deny policy, or run:")
+        lines.append(f"    {_reverse_cli(account_id, budget_name, action_id)}")
+    else:
+        lines.append(f"To reverse the action: assume {recovery_who} and detach the deny policy, or use the "
+                      "console link above (identifiers for the CLI form were unavailable this run).")
     lines.append("")
     lines.append(f"Safety configuration: {safety} ({_safety_label(safety)}).")
     lines.append(f"Observed action status (from AWS Budgets, authoritative): {status} at {status_ts} "
@@ -610,8 +689,13 @@ def build_report(status, status_ts, inv, safety, account_id=None, budget_name=No
     for s in s3_bucket_sizes(deadline_epoch):
         lines.append(f"    - {s}")
     lines.append("")
-    lines.append("To lift the block: reverse the budget action in the console (admin route), "
-                  "or it clears automatically at the next budget period.")
+    # F4: status-conditional call to action -- never claim "to lift the
+    # block" when nothing is applied (PENDING/REVERSE_SUCCESS/STANDBY), and
+    # always give the PENDING approve path since watch mode has no other
+    # way to apply the deny early besides the (Billing-gated) console.
+    lines.append(_call_to_action(status, account_id, budget_name, action_id))
+    if status == "EXECUTION_SUCCESS":
+        lines.append("The block also clears automatically at the next budget period if you take no action.")
     return _fit("\n".join(lines))
 
 
@@ -651,7 +735,9 @@ def handler(event, context):
     inv = inventory(regions, deadline_epoch=deadline)
     if region_failure_area is not None:
         inv["areas"].insert(0, region_failure_area)
+    recovery_principal_arn = os.environ.get("RECOVERY_PRINCIPAL_ARN")
     body = build_report(status, status_ts, inv, safety, account_id=account_id, budget_name=budget_name,
-                         action_details=action_details, deadline_epoch=deadline)
-    publish(report_topic, "AWS Budget Radar: budget threshold reached", body)  # raises on failure
+                         action_details=action_details, deadline_epoch=deadline, action_id=action_id,
+                         recovery_principal_arn=recovery_principal_arn)
+    publish(report_topic, _report_subject(status), body)  # raises on failure
     return {"status": "reported", "action_status": status}

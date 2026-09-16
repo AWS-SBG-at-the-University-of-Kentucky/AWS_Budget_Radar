@@ -24,6 +24,10 @@ export interface PreflightDeps {
     // whether it reports an unhealthy status.
     expired?: boolean; futureStart?: boolean; amount?: number;
     nonDefaultBillingView?: boolean; unhealthy?: boolean;
+    // F5: current spend (CalculatedSpend.ActualSpend.Amount), optional and
+    // backward-compatible, used to warn/fail when a budget is already at or
+    // over the action threshold at deploy time.
+    actualSpend?: number;
   } | null>;
   // Optional, best-effort. When supplied, its results are reported as
   // simulated/qualified — never treated as proof the recovery principal can
@@ -180,7 +184,7 @@ export async function paginateGetGroup(
 export function adaptBudgetForPreflight(b: any): {
   BudgetType?: string; TimeUnit?: string; unit?: string; scoped: boolean;
   expired?: boolean; futureStart?: boolean; amount?: number;
-  nonDefaultBillingView?: boolean; unhealthy?: boolean;
+  nonDefaultBillingView?: boolean; unhealthy?: boolean; actualSpend?: number;
 } {
   const scoped = !!(b?.FilterExpression || (b?.CostFilters && Object.keys(b.CostFilters).length));
   const start = b?.TimePeriod?.Start;
@@ -199,10 +203,67 @@ export function adaptBudgetForPreflight(b: any): {
   // a genuinely HEALTHY one) must NOT be treated as unhealthy.
   const healthStatusRaw = b?.HealthStatus?.Status ?? b?.HealthStatus;
   const unhealthy = typeof healthStatusRaw === "string" && healthStatusRaw.toUpperCase() === "UNHEALTHY";
+  // F5: current spend, straight off DescribeBudget's CalculatedSpend.ActualSpend.Amount.
+  const actualSpend = b?.CalculatedSpend?.ActualSpend?.Amount !== undefined
+    ? Number(b.CalculatedSpend.ActualSpend.Amount) : undefined;
   return {
     BudgetType: b?.BudgetType, TimeUnit: b?.TimeUnit, unit: b?.BudgetLimit?.Unit,
-    scoped, expired, futureStart, amount, nonDefaultBillingView, unhealthy
+    scoped, expired, futureStart, amount, nonDefaultBillingView, unhealthy, actualSpend
   };
+}
+
+// --- F7: error clarity for preflight's own IAM/Budgets lookups. ---
+//
+// The PreflightDeps contract lets getUser/getRole/getGroup/describeBudget
+// return null for "not found" (as before, backward-compatible with every
+// existing fake), OR throw an Error whose `.name` matches the real AWS SDK
+// exception name (e.g. "AccessDeniedException", "NoSuchEntityException").
+// A thrown error is what lets runPreflight distinguish "the caller lacks a
+// permission" (report exactly which one) from "genuinely not found" (a
+// null return) instead of collapsing both into the same generic message.
+const PERMISSION_FOR_KIND: Record<Kind, string> = {
+  user: "iam:GetUser", role: "iam:GetRole", group: "iam:GetGroup"
+};
+
+type EntityResolution =
+  | { ok: true; entity: IamPrincipal | IamGroupInfo | null }
+  | { ok: false; message: string };
+
+async function resolveEntity(kind: Kind, name: string, deps: PreflightDeps): Promise<EntityResolution> {
+  try {
+    let entity: IamPrincipal | IamGroupInfo | null;
+    if (kind === "user") entity = await deps.getUser(name);
+    else if (kind === "role") entity = await deps.getRole(name);
+    else entity = await deps.getGroup(name);
+    return { ok: true, entity };
+  } catch (e: any) {
+    if (e?.name === "AccessDeniedException") {
+      return { ok: false, message: `access denied — the preflight caller lacks ${PERMISSION_FOR_KIND[kind]}` };
+    }
+    if (e?.name === "NoSuchEntityException") {
+      return { ok: true, entity: null }; // same as a null return: genuinely not found
+    }
+    return { ok: false, message: `lookup failed (${e?.name ?? "Error"}: ${e?.message ?? String(e)})` };
+  }
+}
+
+type BudgetResolution =
+  | { ok: true; budget: Awaited<ReturnType<PreflightDeps["describeBudget"]>> }
+  | { ok: false; message: string };
+
+async function resolveBudget(name: string, deps: PreflightDeps): Promise<BudgetResolution> {
+  try {
+    const budget = await deps.describeBudget(name);
+    return { ok: true, budget };
+  } catch (e: any) {
+    if (e?.name === "AccessDeniedException") {
+      return { ok: false, message: "access denied — the preflight caller lacks budgets:DescribeBudget" };
+    }
+    if (e?.name === "NotFoundException") {
+      return { ok: true, budget: null }; // genuinely not found
+    }
+    return { ok: false, message: `lookup failed (${e?.name ?? "Error"}: ${e?.message ?? String(e)})` };
+  }
 }
 
 export async function runPreflight(config: RadarConfig, deps: PreflightDeps): Promise<PreflightResult> {
@@ -293,13 +354,15 @@ export async function runPreflight(config: RadarConfig, deps: PreflightDeps): Pr
       continue;
     }
 
-    let entity: IamGroupInfo | IamPrincipal | null;
-    if (kind === "user") entity = await deps.getUser(bareName);
-    else if (kind === "role") entity = await deps.getRole(bareName);
-    else entity = await deps.getGroup(bareName);
+    const resolution = await resolveEntity(kind, bareName, deps);
+    if (!resolution.ok) {
+      fail(`${kind[0].toUpperCase()}${kind.slice(1)} target "${raw}" could not be checked: ${resolution.message}.`);
+      continue;
+    }
+    const entity: IamGroupInfo | IamPrincipal | null = resolution.entity;
 
     if (!entity) {
-      fail(`${kind[0].toUpperCase()}${kind.slice(1)} target "${raw}" could not be resolved in IAM.`);
+      fail(`${kind[0].toUpperCase()}${kind.slice(1)} target "${raw}" could not be resolved in IAM (not found).`);
       continue;
     }
 
@@ -380,7 +443,27 @@ export async function runPreflight(config: RadarConfig, deps: PreflightDeps): Pr
       "(or via CDK bootstrap/CloudFormation execution roles), those actions are NOT blocked."
     );
   }
-  info("Note: CDK bootstrap and CloudFormation execution roles are typically NOT covered — coverage of those is 'unknown' unless you list them explicitly.");
+  // F6(a): actually compare the resolved target ARNs against the real,
+  // predictable CDK bootstrap role names (the default "hnb659fds" qualifier)
+  // instead of printing a static "typically not covered" note. Region is
+  // only knowable here from the environment (AWS_REGION / CDK_DEFAULT_REGION)
+  // — preflight makes no live lookup for it — so an unresolvable region
+  // (or account) reports "unknown" rather than guessing.
+  const cdkRegion = (process.env.AWS_REGION ?? process.env.CDK_DEFAULT_REGION ?? "").trim();
+  if (!account || !cdkRegion) {
+    info(
+      "CDK bootstrap / CloudFormation execution role coverage: unknown (account and/or region not resolvable " +
+      "from AWS_REGION/CDK_DEFAULT_REGION at preflight time)."
+    );
+  } else {
+    const cdkRoles: Array<{ label: string; arn: string }> = [
+      { label: "CDK bootstrap deploy role", arn: `arn:aws:iam::${account}:role/cdk-hnb659fds-deploy-role-${account}-${cdkRegion}` },
+      { label: "CloudFormation execution role", arn: `arn:aws:iam::${account}:role/cdk-hnb659fds-cfn-exec-role-${account}-${cdkRegion}` }
+    ];
+    for (const { label, arn } of cdkRoles) {
+      info(`${label} (${arn}): ${coveredArns.includes(arn) ? "covered" : "uncovered"} by the deny.`);
+    }
+  }
 
   // --- Recovery route. ---
   info(`Recovery principal: ${config.recoveryPrincipalArn} (must be able to reverse the action / detach the policy; not a deny target).`);
@@ -394,26 +477,36 @@ export async function runPreflight(config: RadarConfig, deps: PreflightDeps): Pr
     fail(`Recovery principal ${config.recoveryPrincipalArn} ${badRecoveryForm}.`);
   } else {
     const recoveryParsed = parseIamArn(config.recoveryPrincipalArn)!; // badTargetForm() confirmed this parses.
-    let recoveryEntity: IamPrincipal | null = null;
-    if (recoveryParsed.kind === "user") recoveryEntity = await deps.getUser(recoveryParsed.name);
-    else if (recoveryParsed.kind === "role") recoveryEntity = await deps.getRole(recoveryParsed.name);
-
-    if (!recoveryEntity) {
-      fail(
-        `Recovery principal ${config.recoveryPrincipalArn} could not be resolved in IAM. ` +
-        `Without a real, existing recovery principal there is no way to reverse the deny if it fires.`
-      );
-    } else if (recoveryEntity.arn !== config.recoveryPrincipalArn) {
-      // F3: same check as the silently-non-attaching guard for targets — the
-      // supplied ARN must equal the RESOLVED identity (account + path), not
-      // just resolve some same-named local entity.
-      fail(
-        `Recovery principal ${config.recoveryPrincipalArn} does not match the resolved identity ${recoveryEntity.arn}; ` +
-        `fix the ARN in .env.`
-      );
+    // F10(c): a group can never assume anything or hold a session of its
+    // own, so it can never actually perform the recovery detach/reversal —
+    // reject it with a specific message instead of falling through to the
+    // generic "could not be resolved" one.
+    if (recoveryParsed.kind === "group") {
+      fail(`Recovery principal ${config.recoveryPrincipalArn} is a group; recovery principal must be an IAM user or role.`);
     } else {
-      recoveryArn = recoveryEntity.arn;
-      info("Recovery principal resolved successfully (exists in IAM) and matches the resolved identity.");
+      const recoveryResolution = await resolveEntity(recoveryParsed.kind, recoveryParsed.name, deps);
+      if (!recoveryResolution.ok) {
+        fail(`Recovery principal ${config.recoveryPrincipalArn} could not be checked: ${recoveryResolution.message}.`);
+      } else {
+        const recoveryEntity = recoveryResolution.entity as IamPrincipal | null;
+        if (!recoveryEntity) {
+          fail(
+            `Recovery principal ${config.recoveryPrincipalArn} could not be resolved in IAM (not found). ` +
+            `Without a real, existing recovery principal there is no way to reverse the deny if it fires.`
+          );
+        } else if (recoveryEntity.arn !== config.recoveryPrincipalArn) {
+          // F3: same check as the silently-non-attaching guard for targets — the
+          // supplied ARN must equal the RESOLVED identity (account + path), not
+          // just resolve some same-named local entity.
+          fail(
+            `Recovery principal ${config.recoveryPrincipalArn} does not match the resolved identity ${recoveryEntity.arn}; ` +
+            `fix the ARN in .env.`
+          );
+        } else {
+          recoveryArn = recoveryEntity.arn;
+          info("Recovery principal resolved successfully (exists in IAM) and matches the resolved identity.");
+        }
+      }
     }
   }
 
@@ -503,6 +596,31 @@ export async function runPreflight(config: RadarConfig, deps: PreflightDeps): Pr
           "prove the recovery principal can be assumed/accessed, nor does it account for SCPs, permission " +
           "boundaries, or other runtime context."
         );
+
+        // F2: a budgets-reversal-ONLY recovery route does not survive
+        // teardown. `cdk destroy` deletes the BudgetsAction (and with it,
+        // the only thing budgets:ExecuteBudgetAction can act on) before the
+        // managed deny policy — if the policy is still attached at that
+        // point, DeleteManagedPolicy fails, and only iam:Detach*Policy can
+        // free the identity afterward. Warn always; fail closed when armed,
+        // since armed can auto-apply the deny with no console step in between.
+        const directDetachAllowed = routeStatuses.some(r => r.name === "direct-detach" && r.status === "allowed");
+        if (!directDetachAllowed && allowedRoute.name === "budgets-reversal") {
+          const detail =
+            "Recovery is allowed ONLY via budgets-reversal (budgets:ExecuteBudgetAction), not direct IAM " +
+            "detach. Budgets-only recovery does NOT survive teardown: `cdk destroy` deletes the BudgetsAction " +
+            "before the managed deny policy, and once the action is gone there is no budgets:ExecuteBudgetAction " +
+            "resource left to reverse — if the deny policy is still attached at that point, DeleteManagedPolicy " +
+            "fails and only iam:Detach{User,Group,Role}Policy can free the identity.";
+          if (config.safety === "armed") {
+            fail(
+              `${detail} Grant the recovery principal iam:Detach*Policy on the target identities as well, or ` +
+              "deploy in watch mode and always reverse-and-verify-detached before ever running cdk destroy."
+            );
+          } else {
+            warn(detail);
+          }
+        }
       } else if (allDenied) {
         fail(
           `Policy simulation indicates NONE of the recovery actions (${RECOVERY_ACTIONS.join(", ")}) provide a ` +
@@ -551,10 +669,13 @@ export async function runPreflight(config: RadarConfig, deps: PreflightDeps): Pr
 
   // --- Path A: existing-budget semantics. ---
   if (config.existingBudgetName) {
-    const b = await deps.describeBudget(config.existingBudgetName);
-    if (!b) {
+    const budgetResolution = await resolveBudget(config.existingBudgetName, deps);
+    if (!budgetResolution.ok) {
+      fail(`Existing budget "${config.existingBudgetName}" could not be checked: ${budgetResolution.message}.`);
+    } else if (!budgetResolution.budget) {
       fail(`Existing budget "${config.existingBudgetName}" not found.`);
     } else {
+      const b = budgetResolution.budget;
       if (b.BudgetType !== "COST") fail(`Budget must be COST; got ${b.BudgetType}.`);
       if (b.TimeUnit !== "MONTHLY") fail(`Budget must be MONTHLY; got ${b.TimeUnit}.`);
       if (b.unit !== "USD") fail(`Budget must be USD; got ${b.unit}.`);
@@ -585,6 +706,23 @@ export async function runPreflight(config: RadarConfig, deps: PreflightDeps): Pr
           `Deploy summary: effective action threshold ~= $${effectiveThresholdUsd.toFixed(2)} USD ` +
           `(existing budget limit $${b.amount} x ACTION_THRESHOLD_PERCENT ${config.actionThresholdPercent}%).`
         );
+
+        // F5: a budget already at/over the action threshold at deploy time
+        // will fire almost immediately (the next AWS Budgets refresh, up to
+        // ~8-12h) rather than acting as a forward-looking tripwire. Warn
+        // loudly always; fail closed when armed, since armed has no console
+        // approval step to catch this before the deny applies.
+        if (typeof b.actualSpend === "number" && Number.isFinite(b.actualSpend) && b.actualSpend >= effectiveThresholdUsd) {
+          const detail =
+            `This budget's current spend ($${b.actualSpend.toFixed(2)}) is already at or over the action ` +
+            `threshold (~$${effectiveThresholdUsd.toFixed(2)}); the deny will fire within hours of deploy, at ` +
+            "the next AWS Budgets refresh — this is NOT a forward-looking tripwire in this state.";
+          if (config.safety === "armed") {
+            fail(`${detail} Deploy in watch mode instead, or raise the budget/threshold, then re-run preflight.`);
+          } else {
+            warn(detail);
+          }
+        }
       } else {
         info("Deploy summary: effective action threshold could not be computed (existing budget's limit amount is unknown/invalid).");
       }
@@ -616,17 +754,28 @@ if (require.main === module) {
         const r = await sts.send(new GetCallerIdentityCommand({}));
         return { Account: r.Account, Arn: r.Arn };
       },
+      // F7: only a genuine "not found" (NoSuchEntityException) is swallowed
+      // to null here — every other error (AccessDeniedException in
+      // particular) is rethrown so runPreflight's resolveEntity() can tell
+      // "does not exist" apart from "the preflight caller lacks permission
+      // to check" instead of collapsing both into the same generic message.
       getUser: async (n) => {
         try {
           const r = await iam.send(new GetUserCommand({ UserName: n }));
           return { arn: r.User!.Arn!, path: r.User!.Path };
-        } catch { return null; }
+        } catch (e: any) {
+          if (e?.name === "NoSuchEntityException") return null;
+          throw e;
+        }
       },
       getRole: async (n) => {
         try {
           const r = await iam.send(new GetRoleCommand({ RoleName: n }));
           return { arn: r.Role!.Arn!, path: r.Role!.Path };
-        } catch { return null; }
+        } catch (e: any) {
+          if (e?.name === "NoSuchEntityException") return null;
+          throw e;
+        }
       },
       // F5: GetGroup is paginated via paginateGetGroup (IsTruncated/Marker),
       // so caller/recovery membership on later pages isn't missed.
@@ -636,7 +785,10 @@ if (require.main === module) {
             const r = await iam.send(new GetGroupCommand({ GroupName: n, Marker: marker }));
             return { Group: r.Group, Users: r.Users, IsTruncated: r.IsTruncated, Marker: r.Marker };
           });
-        } catch { return null; }
+        } catch (e: any) {
+          if (e?.name === "NoSuchEntityException") return null;
+          throw e;
+        }
       },
       describeBudget: async (name) => {
         try {
@@ -645,7 +797,10 @@ if (require.main === module) {
             AccountId: acct, BudgetName: name, ShowFilterExpression: true
           } as any));
           return adaptBudgetForPreflight(r.Budget as any);
-        } catch { return null; }
+        } catch (e: any) {
+          if (e?.name === "NotFoundException") return null;
+          throw e;
+        }
       },
       // Simulated PER ACTION (rather than one batched call) so each action
       // can be scoped to its own known resource ARNs (the target IAM
@@ -677,7 +832,15 @@ if (require.main === module) {
             } else {
               out[action] = allowed ? "allowed" : "denied";
             }
-          } catch {
+          } catch (e: any) {
+            // F7: iam:SimulatePrincipalPolicy is a caller-level permission,
+            // not scoped per simulated action — if the preflight caller
+            // itself lacks it, EVERY action will fail the exact same way,
+            // so short-circuit the whole simulation as unavailable (the
+            // caller sees "caller lacks iam:SimulatePrincipalPolicy" via
+            // runPreflight's applyUnverifiedGate) instead of mislabeling it
+            // "incomplete" (which reads as a MissingContextValues result).
+            if (e?.name === "AccessDeniedException") return null;
             out[action] = "incomplete";
           }
         }

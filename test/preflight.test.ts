@@ -692,3 +692,145 @@ test("TRI-STATE 8: invalid recovery identity still FAILS both safety modes (regr
     expect(r.messages.join("\n")).toMatch(/recovery principal.*could not be resolved/i);
   }
 });
+
+// --- F2: teardown safety — budgets-only recovery does not survive cdk destroy ---
+
+test("F2 teardown: budgets-only recovery route WARNS in watch and FAILS in armed", async () => {
+  const simulateRecoveryPermissions = async () => ({
+    ...ALL_ACTIONS_DENIED,
+    "budgets:ExecuteBudgetAction": true
+  });
+
+  const watch = await runPreflight(
+    cfg({ safety: "watch", denyTargetUsers: ["student"] }),
+    deps({ simulateRecoveryPermissions })
+  );
+  expect(watch.ok).toBe(true);
+  expect(watch.messages.join("\n")).toMatch(/does not survive teardown/i);
+
+  const armed = await runPreflight(
+    cfg({ safety: "armed", denyTargetUsers: ["student"] }),
+    deps({ simulateRecoveryPermissions })
+  );
+  expect(armed.ok).toBe(false);
+  expect(armed.messages.join("\n")).toMatch(/does not survive teardown/i);
+});
+
+test("F2 teardown: no warning when a direct-detach route is ALSO allowed", async () => {
+  const r = await runPreflight(
+    cfg({ denyTargetUsers: ["student"] }),
+    deps({
+      simulateRecoveryPermissions: async () => ({
+        ...ALL_ACTIONS_DENIED,
+        "iam:DetachUserPolicy": true,
+        "budgets:ExecuteBudgetAction": true
+      })
+    })
+  );
+  expect(r.ok).toBe(true);
+  expect(r.messages.join("\n")).not.toMatch(/does not survive teardown/i);
+});
+
+// --- F5: already-breached budget at deploy (Path A) ---
+
+test("F5: existing budget already at/over the action threshold WARNS in watch", async () => {
+  const r = await runPreflight(cfg({ existingBudgetName: "B", actionThresholdPercent: 100 }), deps({
+    describeBudget: async () => ({
+      BudgetType: "COST", TimeUnit: "MONTHLY", unit: "USD", scoped: false, amount: 10, actualSpend: 10
+    })
+  }));
+  expect(r.ok).toBe(true);
+  expect(r.messages.join("\n")).toMatch(/already at or over the action threshold/i);
+});
+
+test("F5: existing budget already over the action threshold FAILS in armed", async () => {
+  const r = await runPreflight(cfg({ existingBudgetName: "B", safety: "armed", actionThresholdPercent: 50 }), deps({
+    describeBudget: async () => ({
+      BudgetType: "COST", TimeUnit: "MONTHLY", unit: "USD", scoped: false, amount: 10, actualSpend: 6
+    })
+  }));
+  expect(r.ok).toBe(false);
+  expect(r.messages.join("\n")).toMatch(/already at or over the action threshold/i);
+});
+
+test("F5: existing budget well under the action threshold passes without the already-breached warning", async () => {
+  const r = await runPreflight(cfg({ existingBudgetName: "B" }), deps({
+    describeBudget: async () => ({
+      BudgetType: "COST", TimeUnit: "MONTHLY", unit: "USD", scoped: false, amount: 10, actualSpend: 1
+    })
+  }));
+  expect(r.ok).toBe(true);
+  expect(r.messages.join("\n")).not.toMatch(/already at or over the action threshold/i);
+});
+
+// --- F6(a): CDK bootstrap / CloudFormation execution role coverage ---
+
+describe("F6(a): CDK bootstrap/cfn-exec role coverage", () => {
+  const OLD_ENV = process.env;
+  afterEach(() => { process.env = { ...OLD_ENV }; });
+
+  test("reports 'covered' for a target ARN that matches the CDK deploy role, when region is resolvable", async () => {
+    process.env.CDK_DEFAULT_REGION = "us-east-1";
+    delete process.env.AWS_REGION;
+    const deployRoleName = "cdk-hnb659fds-deploy-role-111122223333-us-east-1";
+    const r = await runPreflight(cfg({ denyTargetRoles: [deployRoleName] }), deps());
+    expect(r.messages.join("\n")).toMatch(/CDK bootstrap deploy role.*: covered by the deny/i);
+  });
+
+  test("reports 'unknown' coverage when the region cannot be resolved from the environment", async () => {
+    delete process.env.AWS_REGION;
+    delete process.env.CDK_DEFAULT_REGION;
+    const r = await runPreflight(cfg(), deps());
+    expect(r.messages.join("\n")).toMatch(/coverage: unknown/i);
+  });
+});
+
+// --- F7: preflight error clarity — AccessDenied vs NoSuchEntity ---
+
+test("F7: AccessDeniedException resolving a deny target names the missing permission", async () => {
+  const r = await runPreflight(cfg(), deps({
+    getUser: async () => { throw Object.assign(new Error("denied"), { name: "AccessDeniedException" }); }
+  }));
+  expect(r.ok).toBe(false);
+  const text = r.messages.join("\n");
+  expect(text).toMatch(/access denied/i);
+  expect(text).toMatch(/iam:GetUser/);
+});
+
+test("F7: NoSuchEntityException resolving a deny target reports 'not found', not a generic incomplete message", async () => {
+  const r = await runPreflight(cfg(), deps({
+    getUser: async () => { throw Object.assign(new Error("no such user"), { name: "NoSuchEntityException" }); }
+  }));
+  expect(r.ok).toBe(false);
+  expect(r.messages.join("\n")).toMatch(/not found/i);
+});
+
+test("F7: AccessDeniedException resolving the recovery principal names the missing permission", async () => {
+  const r = await runPreflight(cfg(), deps({
+    getRole: async () => { throw Object.assign(new Error("denied"), { name: "AccessDeniedException" }); }
+  }));
+  expect(r.ok).toBe(false);
+  const text = r.messages.join("\n");
+  expect(text).toMatch(/recovery principal/i);
+  expect(text).toMatch(/access denied/i);
+  expect(text).toMatch(/iam:GetRole/);
+});
+
+test("F7: AccessDeniedException describing an existing budget names the missing permission", async () => {
+  const r = await runPreflight(cfg({ existingBudgetName: "B" }), deps({
+    describeBudget: async () => { throw Object.assign(new Error("denied"), { name: "AccessDeniedException" }); }
+  }));
+  expect(r.ok).toBe(false);
+  expect(r.messages.join("\n")).toMatch(/budgets:DescribeBudget/);
+});
+
+// --- F10(c): a GROUP recovery principal is invalid ---
+
+test("F10(c): rejects a GROUP ARN as the recovery principal with a specific message", async () => {
+  const r = await runPreflight(
+    cfg({ recoveryPrincipalArn: "arn:aws:iam::111122223333:group/Admins" }),
+    deps()
+  );
+  expect(r.ok).toBe(false);
+  expect(r.messages.join("\n")).toMatch(/recovery principal must be an IAM user or role/i);
+});

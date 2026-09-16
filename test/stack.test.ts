@@ -166,6 +166,29 @@ test("reporter receives account/budget/action env identifiers", () => {
   }));
 });
 
+// --- F1(c): recovery principal named in the report instead of generic wording ---
+
+test("reporter receives RECOVERY_PRINCIPAL_ARN as an env var", () => {
+  const t = synth(cfg);
+  const fn = Object.values(t.findResources("AWS::Lambda::Function"))[0].Properties;
+  expect(fn.Environment.Variables).toEqual(expect.objectContaining({
+    RECOVERY_PRINCIPAL_ARN: cfg.recoveryPrincipalArn
+  }));
+});
+
+// --- F9: cross-account guard must not throw on an unresolved (token) account ---
+
+test("a full-ARN same-looking target does not throw when the stack account is an unresolved token", () => {
+  const app = new cdk.App();
+  // No env.account supplied at all: cdk.Stack.of(this).account resolves to
+  // an unresolved pseudo-parameter token, not a concrete account string —
+  // mirrors credential-free synth with no CDK_DEFAULT_ACCOUNT set.
+  const badCfg: RadarConfig = { ...cfg, denyTargetRoles: ["arn:aws:iam::999999999999:role/Other"] };
+  let stack!: BudgetRadarStack;
+  expect(() => { stack = new BudgetRadarStack(app, "TestStackNoAccount", { config: badCfg }); }).not.toThrow();
+  expect(() => Template.fromStack(stack)).not.toThrow();
+});
+
 test("reporter role is granted s3:GetBucketLocation (read-only, needed to size buckets in their own region)", () => {
   const t = synth(cfg);
   t.hasResourceProperties("AWS::IAM::Policy", Match.objectLike({

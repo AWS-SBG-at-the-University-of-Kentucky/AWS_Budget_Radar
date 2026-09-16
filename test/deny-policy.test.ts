@@ -24,6 +24,25 @@ test("self-lockout guard: does not deny iam:DetachUserPolicy", () => {
   expect(DENY_ACTIONS).not.toContain("iam:DetachUserPolicy");
 });
 
+// --- F6(b): additional pure creation/start actions, none of them cleanup ---
+
+test("F6(b): denies the new pure creation/start actions", () => {
+  expect(DENY_ACTIONS).toEqual(expect.arrayContaining([
+    "sagemaker:StartNotebookInstance", "sagemaker:CreateApp", "rds:StartDBCluster",
+    "ec2:RequestSpotInstances", "ec2:RequestSpotFleet", "ec2:CreateFleet"
+  ]));
+});
+
+test("F6(b): new actions still respect the never-iam/budgets/cloudformation/read-only invariant", () => {
+  for (const a of ["sagemaker:StartNotebookInstance", "sagemaker:CreateApp", "rds:StartDBCluster",
+                    "ec2:RequestSpotInstances", "ec2:RequestSpotFleet", "ec2:CreateFleet"]) {
+    expect(a).not.toMatch(/^iam:/);
+    expect(a).not.toMatch(/^budgets:/);
+    expect(a).not.toMatch(/^cloudformation:/);
+    expect(a).not.toMatch(/:(Describe|List|Get)/);
+  }
+});
+
 test("policy document is a single Deny statement, never wildcard", () => {
   const doc = denyPolicyDocument();
   expect(doc.Statement).toHaveLength(1);

@@ -69,7 +69,9 @@ export class BudgetRadarStack extends cdk.Stack {
       environment: {
         REPORT_TOPIC_ARN: this.reportTopic.topicArn,
         TRIGGER_TOPIC_ARN: this.triggerTopic.topicArn,
-        SAFETY: config.safety
+        SAFETY: config.safety,
+        // F1(c): named in the report's recovery line instead of generic wording.
+        RECOVERY_PRINCIPAL_ARN: config.recoveryPrincipalArn
         // ACCOUNT_ID / BUDGET_NAME / ACTION_ID are added below, once the
         // budget and action exist.
       }
@@ -125,7 +127,11 @@ export class BudgetRadarStack extends cdk.Stack {
     }));
 
     // --- Determine the budget name and (Path B) create the budget. ---
-    const budgetName = config.existingBudgetName ?? `budget-radar-${cdk.Names.uniqueId(this).slice(-8)}`;
+    // F10(a): unique per stack+region (both resolve at deploy time) rather
+    // than a uniqueId suffix, so the name is stable and predictable across
+    // re-deploys of the same stack instead of changing whenever the
+    // construct tree shifts.
+    const budgetName = config.existingBudgetName ?? `budget-radar-${this.stackName}-${this.region}`;
 
     let budget: cdk.aws_budgets.CfnBudget | undefined;
     if (!config.existingBudgetName) {
@@ -207,8 +213,14 @@ export class BudgetRadarStack extends cdk.Stack {
         // Full ARN supplied: it must name this stack's own account. Budgets
         // attach/detach is not designed for cross-account targets, and
         // silently accepting one would let a typo'd/foreign ARN pass synth.
+        // F9: when `account` is an unresolved CDK token (credential-free
+        // synth with no CDK_DEFAULT_ACCOUNT — e.g. `cdk synth` in CI, or
+        // this project's own synth test), there is no concrete account to
+        // compare against yet, so skip the mismatch check rather than
+        // throwing on a token that simply hasn't resolved. A CONCRETE
+        // account mismatch still throws exactly as before.
         const arnAccount = name.split(":")[4];
-        if (arnAccount !== account) {
+        if (!cdk.Token.isUnresolved(account) && arnAccount !== account) {
           throw new Error(
             `deny target ${name} is in a different account than the stack; attach/detach must be same-account`
           );

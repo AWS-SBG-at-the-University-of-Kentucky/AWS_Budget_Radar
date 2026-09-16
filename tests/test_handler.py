@@ -1132,3 +1132,140 @@ def test_log_full_report_preserves_emoji_split_across_chunk_boundary(monkeypatch
     captured = capsys.readouterr()
     assert "\U0001F600" in captured.out
     assert "�" not in captured.out
+
+
+# --- F1: Billing-console-gate honesty -- concrete CLI recovery + named recovery principal ---
+
+def test_reverse_cli_built_from_real_ids():
+    cli = handler._reverse_cli("111122223333", "my-budget", "aaaa-bbbb")
+    assert cli == (
+        "aws budgets execute-budget-action --account-id 111122223333 "
+        "--budget-name my-budget --action-id aaaa-bbbb --execution-type REVERSE_BUDGET_ACTION"
+    )
+
+
+def test_approve_cli_built_from_real_ids():
+    cli = handler._approve_cli("111122223333", "my-budget", "aaaa-bbbb")
+    assert cli == (
+        "aws budgets execute-budget-action --account-id 111122223333 "
+        "--budget-name my-budget --action-id aaaa-bbbb --execution-type APPROVE_BUDGET_ACTION"
+    )
+
+
+def test_report_contains_reverse_cli_with_real_ids_and_named_recovery_principal():
+    inv = {"areas": [], "generated": "2026-09-15T00:00:00+00:00"}
+    body = handler.build_report(
+        "EXECUTION_SUCCESS", "2026-09-15T00:00:00+00:00", inv, "armed",
+        account_id="111122223333", budget_name="my-budget", action_id="aaaa-bbbb",
+        recovery_principal_arn="arn:aws:iam::111122223333:role/RecoveryAdmin"
+    )
+    assert handler._reverse_cli("111122223333", "my-budget", "aaaa-bbbb") in body
+    assert "arn:aws:iam::111122223333:role/RecoveryAdmin" in body
+    # The generic placeholder wording must be gone once a real ARN is known.
+    assert "RECOVERY_PRINCIPAL_ARN; see README" not in body
+
+
+def test_report_falls_back_to_generic_recovery_wording_when_arn_not_supplied():
+    inv = {"areas": [], "generated": "2026-09-15T00:00:00+00:00"}
+    body = handler.build_report(
+        "EXECUTION_SUCCESS", "2026-09-15T00:00:00+00:00", inv, "armed",
+        account_id="111122223333", budget_name="my-budget", action_id="aaaa-bbbb"
+    )
+    assert "RECOVERY_PRINCIPAL_ARN" in body
+
+
+def test_pending_report_contains_approve_cli():
+    inv = {"areas": [], "generated": "2026-09-15T00:00:00+00:00"}
+    body = handler.build_report(
+        "PENDING", "2026-09-15T00:00:00+00:00", inv, "watch",
+        account_id="111122223333", budget_name="my-budget", action_id="aaaa-bbbb"
+    )
+    assert handler._approve_cli("111122223333", "my-budget", "aaaa-bbbb") in body
+
+
+# --- F3: subject/headline derived from the OBSERVED status ---
+
+def test_report_subject_pending_and_execution_statuses():
+    assert handler._report_subject("PENDING") == "AWS Budget Radar: budget threshold reached — action PENDING"
+    assert handler._report_subject("EXECUTION_SUCCESS") == \
+        "AWS Budget Radar: budget threshold reached — action EXECUTION_SUCCESS"
+    assert handler._report_subject("EXECUTION_FAILURE") == \
+        "AWS Budget Radar: budget threshold reached — action EXECUTION_FAILURE"
+
+
+def test_report_subject_reverse_reset_standby_statuses():
+    assert handler._report_subject("REVERSE_SUCCESS") == \
+        "AWS Budget Radar: budget action status changed: REVERSE_SUCCESS"
+    assert handler._report_subject("RESET_FAILURE") == \
+        "AWS Budget Radar: budget action status changed: RESET_FAILURE"
+    assert handler._report_subject("STANDBY") == \
+        "AWS Budget Radar: budget action status changed: STANDBY"
+
+
+def test_report_subject_unknown_status():
+    assert handler._report_subject("UNKNOWN") == "AWS Budget Radar: budget action notification (status unknown)"
+
+
+def test_handler_publishes_with_status_derived_subject(monkeypatch):
+    monkeypatch.setenv("TRIGGER_TOPIC_ARN", "arn:aws:sns:us-east-1:111122223333:Trigger")
+    monkeypatch.setenv("ACCOUNT_ID", "111122223333")
+    monkeypatch.setenv("BUDGET_NAME", "b")
+    monkeypatch.setenv("ACTION_ID", "11111111-1111-1111-1111-111111111111")
+    monkeypatch.setenv("REPORT_TOPIC_ARN", "arn:aws:sns:us-east-1:111122223333:Report")
+
+    monkeypatch.setattr(handler, "enabled_regions", lambda: [])
+    monkeypatch.setattr(handler, "observe_action_status",
+                         lambda a, b, c: ("REVERSE_SUCCESS", "2024-01-01T00:00:00+00:00", None))
+    monkeypatch.setattr(handler, "inventory",
+                         lambda regions, deadline_epoch: {"areas": [], "generated": "2024-01-01T00:00:00+00:00"})
+    monkeypatch.setattr(handler, "s3_bucket_sizes", lambda deadline_epoch=None: [])
+
+    published = {}
+
+    def fake_publish(topic_arn, subject, body):
+        published["subject"] = subject
+
+    monkeypatch.setattr(handler, "publish", fake_publish)
+    event = {"Records": [{"Sns": {"TopicArn": "arn:aws:sns:us-east-1:111122223333:Trigger", "Message": "x"}}]}
+    handler.handler(event, None)
+    assert published["subject"] == "AWS Budget Radar: budget action status changed: REVERSE_SUCCESS"
+
+
+# --- F4: watch-mode call-to-action is status-conditional ---
+
+def test_call_to_action_pending_says_nothing_blocked_yet_with_approve_cli():
+    text = handler._call_to_action("PENDING", "111122223333", "my-budget", "aaaa-bbbb")
+    assert "NOTHING IS BLOCKED YET" in text
+    assert handler._approve_cli("111122223333", "my-budget", "aaaa-bbbb") in text
+
+
+def test_call_to_action_execution_success_says_block_applied_with_reverse_cli():
+    text = handler._call_to_action("EXECUTION_SUCCESS", "111122223333", "my-budget", "aaaa-bbbb")
+    assert "block is applied" in text.lower()
+    assert handler._reverse_cli("111122223333", "my-budget", "aaaa-bbbb") in text
+
+
+def test_call_to_action_reverse_success_and_standby_say_no_block_in_effect():
+    for status in ("REVERSE_SUCCESS", "STANDBY"):
+        text = handler._call_to_action(status, "111122223333", "my-budget", "aaaa-bbbb")
+        assert text == "No block is in effect."
+
+
+def test_pending_report_never_says_to_lift_the_block():
+    inv = {"areas": [], "generated": "2026-09-15T00:00:00+00:00"}
+    body = handler.build_report(
+        "PENDING", "2026-09-15T00:00:00+00:00", inv, "watch",
+        account_id="111122223333", budget_name="my-budget", action_id="aaaa-bbbb"
+    )
+    assert "to lift the block" not in body.lower()
+    assert "nothing is blocked yet" in body.lower()
+
+
+def test_execution_success_report_does_say_how_to_lift_the_block():
+    inv = {"areas": [], "generated": "2026-09-15T00:00:00+00:00"}
+    body = handler.build_report(
+        "EXECUTION_SUCCESS", "2026-09-15T00:00:00+00:00", inv, "armed",
+        account_id="111122223333", budget_name="my-budget", action_id="aaaa-bbbb"
+    )
+    assert "the block is applied" in body.lower()
+    assert handler._reverse_cli("111122223333", "my-budget", "aaaa-bbbb") in body
