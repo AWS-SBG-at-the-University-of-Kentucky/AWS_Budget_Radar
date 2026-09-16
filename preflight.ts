@@ -29,8 +29,32 @@ export interface PreflightDeps {
   // simulated/qualified — never treated as proof the recovery principal can
   // actually reverse the deny (real evaluation also depends on SCPs, other
   // attached policies, and permission boundaries that simulation can miss).
-  simulateRecoveryPermissions?(principalArn: string, actions: string[]): Promise<Record<string, boolean> | null>;
+  //
+  // Per-action result is tri-state, expressed as a backward-compatible
+  // superset of the original boolean map: `true`/`false` remain the
+  // shorthand for "allowed"/"denied" (existing fakes keep working
+  // unmodified), and the string literals let a fake (or the real
+  // SimulatePrincipalPolicy-backed impl in main() below) additionally
+  // express "incomplete" — IAM returned MissingContextValues (e.g. a policy
+  // condition on iam:PolicyARN that can't be supplied because the deny
+  // policy doesn't exist yet at preflight time), or the check inherently
+  // depends on a deploy-time-only ARN (the not-yet-created budgets action
+  // ARN) that must never be fabricated. "incomplete" is NOT "denied" — it
+  // means "could not be verified either way".
+  //
+  // `context.resourceArnsByAction` is an OPTIONAL third argument (ignored by
+  // any two-parameter fake, since JS/TS callbacks may omit trailing
+  // parameters) giving the real implementation the KNOWN target entity ARNs
+  // to scope each detach action's simulation to.
+  simulateRecoveryPermissions?(
+    principalArn: string,
+    actions: string[],
+    context?: { resourceArnsByAction?: Record<string, string[]> }
+  ): Promise<Record<string, RecoveryActionResult> | null>;
 }
+
+// See the doc comment on simulateRecoveryPermissions above.
+export type RecoveryActionResult = boolean | "allowed" | "denied" | "incomplete";
 
 type Kind = "user" | "group" | "role";
 
@@ -55,6 +79,46 @@ const RECOVERY_ACTIONS = [
   "iam:DetachRolePolicy",
   "budgets:ExecuteBudgetAction"
 ];
+
+const DETACH_ACTION_FOR_KIND: Record<Kind, string> = {
+  user: "iam:DetachUserPolicy",
+  group: "iam:DetachGroupPolicy",
+  role: "iam:DetachRolePolicy"
+};
+
+// Per-action tri-state outcome, normalized from whatever the (possibly
+// legacy-boolean) simulateRecoveryPermissions dep returned. An action the
+// dep didn't report at all is treated as "incomplete" (never as a
+// definitive "denied") — fail-closed for what it means ("could not be
+// verified"), but never a false accusation of an explicit deny.
+type ActionOutcome = "allowed" | "denied" | "incomplete";
+
+function normalizeActionOutcome(v: RecoveryActionResult | undefined): ActionOutcome {
+  if (v === true || v === "allowed") return "allowed";
+  if (v === false || v === "denied") return "denied";
+  return "incomplete";
+}
+
+// A recovery ROUTE: a set of actions that must ALL be "allowed" for that
+// route to be usable. See the module-level gate rules in runPreflight below
+// for how routes combine into an overall ALLOWED/DENIED/UNVERIFIED status.
+interface RouteDef { name: string; actions: string[]; }
+interface RouteStatus { name: string; status: ActionOutcome; outcomes: Record<string, ActionOutcome>; }
+
+function evaluateRoute(route: RouteDef, sim: Record<string, RecoveryActionResult>): RouteStatus {
+  const outcomes: Record<string, ActionOutcome> = {};
+  for (const action of route.actions) outcomes[action] = normalizeActionOutcome(sim[action]);
+  const values = Object.values(outcomes);
+  let status: ActionOutcome;
+  if (values.every(v => v === "allowed")) status = "allowed";
+  else if (values.some(v => v === "incomplete")) status = "incomplete"; // incomplete beats a partial denial
+  else status = "denied"; // not all allowed, none incomplete -> at least one definitive deny
+  return { name: route.name, status, outcomes };
+}
+
+function formatRouteOutcomes(r: RouteStatus): string {
+  return `${r.name} [${Object.entries(r.outcomes).map(([a, o]) => `${a}=${o}`).join(", ")}]`;
+}
 
 // Matches an STS assumed-role session ARN, capturing (account, role name).
 // e.g. "arn:aws:sts::111122223333:assumed-role/DevRole/session-name" ->
@@ -362,45 +426,111 @@ export async function runPreflight(config: RadarConfig, deps: PreflightDeps): Pr
     "for a MANUAL-approval action, budgets:ExecuteBudgetAction. This preflight does not prove those permissions."
   );
 
-  // F2: recovery-permission simulation must actually GATE deployment, not
-  // just be printed and ignored. Rules:
-  //  - simulation available + ALL routes denied -> FAIL (no working recovery route).
-  //  - simulation available + at least ONE route allowed -> pass (don't require every action).
-  //  - simulation unavailable (no dep, or the call itself failed) -> don't hard-fail on
-  //    that alone, but clearly report recovery as UNVERIFIED (existence-only).
-  //  Never claim simulation proves the recovery principal can be assumed/accessed.
-  if (deps.simulateRecoveryPermissions) {
-    const sim = await deps.simulateRecoveryPermissions(config.recoveryPrincipalArn, RECOVERY_ACTIONS);
-    if (sim) {
-      const lines = Object.entries(sim).map(
-        ([action, allowed]) => `  - ${action}: ${allowed ? "allowed (simulated)" : "NOT allowed (simulated)"}`
-      );
-      info(`Policy simulation (best-effort, may not reflect SCPs/permission boundaries/runtime context):\n${lines.join("\n")}`);
-      const anyRouteAllowed = Object.values(sim).some(v => v === true);
-      if (!anyRouteAllowed) {
+  // F2/F3/F4 (tri-state recovery gate): recovery-permission simulation must
+  // actually GATE deployment, not just be printed and ignored — but a single
+  // arbitrary allowed action is NOT a usable recovery route (F2), an
+  // unavailable simulation must not silently pass armed (F3), and the
+  // simulation must be given enough context (known target entity ARNs) that
+  // a properly-scoped recovery policy isn't misjudged as denied (F4).
+  //
+  // Two candidate ROUTES:
+  //  - direct-detach: for EVERY configured target identity TYPE, the
+  //    recovery principal can Detach{User,Group,Role}Policy on that type's
+  //    target entities. A single irrelevant allowed detach (e.g. group
+  //    detach when only roles are targeted) is not a route.
+  //  - budgets-reversal: the recovery principal can budgets:ExecuteBudgetAction.
+  //    Its resource (the budget action ARN) does not exist yet at preflight
+  //    time and is never fabricated, so a non-allowed result here can only
+  //    ever be "incomplete", never "denied" (see main()'s real impl below).
+  //
+  // Per-action outcome is allowed | denied (complete-context deny) |
+  // incomplete (MissingContextValues, or the check depends on a
+  // not-yet-created deploy-time ARN). Overall status:
+  //  - ALLOWED  if any route is fully allowed.
+  //  - DENIED   if simulation ran and every route is denied, with zero incompletes.
+  //  - UNVERIFIED otherwise (simulation unavailable/absent, or any route incomplete).
+  // Only skip this gate when the recovery identity itself is already invalid
+  // (fail() above already covers that case; simulating against an
+  // unresolvable principal would be meaningless).
+  if (recoveryArn) {
+    const configuredKinds: Kind[] = (["user", "group", "role"] as const).filter(k =>
+      resolved.some(r => r.kind === k)
+    );
+    const routes: RouteDef[] = [];
+    if (configuredKinds.length) {
+      routes.push({ name: "direct-detach", actions: configuredKinds.map(k => DETACH_ACTION_FOR_KIND[k]) });
+    }
+    routes.push({ name: "budgets-reversal", actions: ["budgets:ExecuteBudgetAction"] });
+
+    const resourceArnsByAction: Record<string, string[]> = {};
+    for (const k of configuredKinds) {
+      resourceArnsByAction[DETACH_ACTION_FOR_KIND[k]] = resolved.filter(r => r.kind === k).map(r => r.arn);
+    }
+
+    let sim: Record<string, RecoveryActionResult> | null = null;
+    if (deps.simulateRecoveryPermissions) {
+      try {
+        sim = await deps.simulateRecoveryPermissions(config.recoveryPrincipalArn, RECOVERY_ACTIONS, { resourceArnsByAction });
+      } catch {
+        sim = null;
+      }
+    }
+
+    const applyUnverifiedGate = (detail: string) => {
+      if (config.safety === "armed") {
         fail(
-          `Policy simulation indicates NONE of the recovery actions (${RECOVERY_ACTIONS.join(", ")}) are allowed ` +
-          `for ${config.recoveryPrincipalArn}. Without at least one working recovery route, a deny cannot be ` +
-          `reversed. Grant the recovery principal permission to detach the deny policy or execute the budget ` +
-          `action, then re-run preflight.`
+          `${detail} Recovery could not be verified; armed auto-applies the deny — deploy in watch mode or ` +
+          `grant a verifiable recovery route.`
         );
       } else {
+        warn(`${detail} Recovery UNVERIFIED — verify you can lift the deny BEFORE approving it in the console.`);
+      }
+    };
+
+    if (sim) {
+      const lines = Object.entries(sim).map(
+        ([action, v]) => `  - ${action}: ${normalizeActionOutcome(v).toUpperCase()} (simulated)`
+      );
+      info(`Policy simulation (best-effort, may not reflect SCPs/permission boundaries/runtime context):\n${lines.join("\n")}`);
+
+      const routeStatuses = routes.map(r => evaluateRoute(r, sim!));
+      const allowedRoute = routeStatuses.find(r => r.status === "allowed");
+      const allDenied = routeStatuses.every(r => r.status === "denied");
+
+      if (allowedRoute) {
         info(
-          "At least one simulated recovery route is allowed. This does not prove the recovery principal can be " +
-          "assumed/accessed, nor does it account for SCPs, permission boundaries, or other runtime context."
+          `At least one simulated recovery route is allowed: ${formatRouteOutcomes(allowedRoute)}. This does not ` +
+          "prove the recovery principal can be assumed/accessed, nor does it account for SCPs, permission " +
+          "boundaries, or other runtime context."
+        );
+      } else if (allDenied) {
+        fail(
+          `Policy simulation indicates NONE of the recovery actions (${RECOVERY_ACTIONS.join(", ")}) provide a ` +
+          `working recovery route for ${config.recoveryPrincipalArn} (${routeStatuses.map(formatRouteOutcomes).join("; ")}). ` +
+          `Without at least one complete, working recovery route, a deny cannot be reversed. Grant the recovery ` +
+          `principal permission to detach the deny policy (for every targeted identity type) or execute the ` +
+          `budget action, then re-run preflight.`
+        );
+      } else {
+        applyUnverifiedGate(
+          `Recovery is UNVERIFIED: at least one recovery route's simulation was incomplete (MissingContextValues, ` +
+          `or it depends on a deploy-time-only ARN that does not exist yet and is never fabricated) — ` +
+          `${routeStatuses.map(formatRouteOutcomes).join("; ")}.`
         );
       }
-    } else {
-      warn(
+    } else if (deps.simulateRecoveryPermissions) {
+      applyUnverifiedGate(
         "Policy simulation was unavailable (e.g. caller lacks iam:SimulatePrincipalPolicy); recovery is " +
         "UNVERIFIED (existence-only) — manually confirm the recovery principal holds working permissions."
       );
+    } else {
+      applyUnverifiedGate(
+        "No permission-simulation capability was provided; recovery is UNVERIFIED (existence-only) — manually " +
+        "confirm the recovery principal holds working permissions."
+      );
     }
   } else {
-    warn(
-      "No permission-simulation capability was provided; recovery is UNVERIFIED (existence-only) — manually " +
-      "confirm the recovery principal holds working permissions."
-    );
+    info("Recovery permission simulation skipped because the recovery principal could not be validated above.");
   }
 
   // Augmentation 1 (recovery half): recovery principal covered via a
@@ -517,17 +647,41 @@ if (require.main === module) {
           return adaptBudgetForPreflight(r.Budget as any);
         } catch { return null; }
       },
-      simulateRecoveryPermissions: async (principalArn, actions) => {
-        try {
-          const r = await iam.send(new SimulatePrincipalPolicyCommand({
-            PolicySourceArn: principalArn, ActionNames: actions
-          }));
-          const out: Record<string, boolean> = {};
-          for (const res of r.EvaluationResults ?? []) {
-            if (res.EvalActionName) out[res.EvalActionName] = res.EvalDecision === "allowed";
+      // Simulated PER ACTION (rather than one batched call) so each action
+      // can be scoped to its own known resource ARNs (the target IAM
+      // entities — real and known at preflight time) via
+      // context.resourceArnsByAction. budgets:ExecuteBudgetAction has no
+      // known resource (the budget action ARN doesn't exist yet and is
+      // never fabricated), so it's simulated resource-less and any
+      // non-allowed result is reported as "incomplete", never "denied" —
+      // see runPreflight's tri-state gate for how that's combined into an
+      // overall ALLOWED/DENIED/UNVERIFIED recovery status.
+      simulateRecoveryPermissions: async (principalArn, actions, context) => {
+        const out: Record<string, RecoveryActionResult> = {};
+        for (const action of actions) {
+          const resourceArns = context?.resourceArnsByAction?.[action];
+          try {
+            const r = await iam.send(new SimulatePrincipalPolicyCommand({
+              PolicySourceArn: principalArn,
+              ActionNames: [action],
+              ...(resourceArns && resourceArns.length ? { ResourceArns: resourceArns } : {})
+            }));
+            const res = r.EvaluationResults?.[0];
+            if (!res) { out[action] = "incomplete"; continue; }
+            if ((res.MissingContextValues ?? []).length > 0) { out[action] = "incomplete"; continue; }
+            const allowed = res.EvalDecision === "allowed";
+            if (action === "budgets:ExecuteBudgetAction" && !resourceArns) {
+              // Resource (the budget action ARN) is unknown pre-deploy — a
+              // non-allowed result can't be trusted as a definitive deny.
+              out[action] = allowed ? "allowed" : "incomplete";
+            } else {
+              out[action] = allowed ? "allowed" : "denied";
+            }
+          } catch {
+            out[action] = "incomplete";
           }
-          return out;
-        } catch { return null; }
+        }
+        return out;
       }
     };
 

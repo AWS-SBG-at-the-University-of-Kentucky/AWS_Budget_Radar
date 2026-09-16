@@ -230,7 +230,11 @@ test("notes when simulation is unavailable rather than silently skipping it", as
   expect(r.messages.join("\n")).toMatch(/simulation was unavailable/i);
 });
 
-// --- F2: recovery permission simulation must GATE (fail-closed) ---
+// --- F2: recovery permission simulation must GATE. Note: as of the
+// tri-state gate (task 16) this is only unconditionally fail-closed for a
+// DENIED or invalid-identity result; an UNVERIFIED result fails closed only
+// in SAFETY=armed (SAFETY=watch passes with a warning instead) — see the
+// "TRI-STATE" test block below for full coverage of all three statuses. ---
 
 test("F2: all-denied simulation fails preflight closed", async () => {
   const r = await runPreflight(cfg(), deps({
@@ -545,4 +549,146 @@ test("deploy summary includes a cost-metric/credits caveat and a near-zero-not-$
   const text = r.messages.join("\n");
   expect(text).toMatch(/credits/i);
   expect(text).toMatch(/near-zero/i);
+});
+
+// --- Task 16: tri-state recovery gate (ALLOWED / DENIED / UNVERIFIED) ---
+// Covers all 8 outcomes required by the task-16 brief. A single arbitrary
+// allowed action is never enough (F2); an unverifiable simulation must not
+// silently pass when armed (F3); the deny-policy/budget-action ARNs are
+// never fabricated, so a route needing one of them is UNVERIFIED, not
+// DENIED (F4).
+
+const ALL_ACTIONS_DENIED: Record<string, boolean> = {
+  "iam:DetachUserPolicy": false,
+  "iam:DetachGroupPolicy": false,
+  "iam:DetachRolePolicy": false,
+  "budgets:ExecuteBudgetAction": false
+};
+
+test("TRI-STATE 1: ALLOWED via complete direct-detach (all targeted types' detach allowed)", async () => {
+  const r = await runPreflight(
+    cfg({ denyTargetUsers: ["student"], denyTargetRoles: ["Grader"] }),
+    deps({
+      simulateRecoveryPermissions: async () => ({
+        ...ALL_ACTIONS_DENIED,
+        "iam:DetachUserPolicy": true,
+        "iam:DetachRolePolicy": true
+        // DetachGroupPolicy stays denied and budgets stays denied — groups
+        // aren't targeted, so DetachGroupPolicy is irrelevant either way.
+      })
+    })
+  );
+  expect(r.ok).toBe(true);
+  expect(r.messages.join("\n")).toMatch(/direct-detach/i);
+});
+
+test("TRI-STATE 2: ALLOWED via budgets-reversal route alone", async () => {
+  const r = await runPreflight(
+    cfg({ denyTargetUsers: ["student"] }),
+    deps({
+      simulateRecoveryPermissions: async () => ({
+        ...ALL_ACTIONS_DENIED,
+        "budgets:ExecuteBudgetAction": true
+      })
+    })
+  );
+  expect(r.ok).toBe(true);
+  expect(r.messages.join("\n")).toMatch(/budgets-reversal/i);
+});
+
+test("TRI-STATE 3: DENIED (every route denied, complete context, none incomplete) fails BOTH watch and armed", async () => {
+  for (const safety of ["watch", "armed"] as const) {
+    const r = await runPreflight(
+      cfg({ safety, denyTargetUsers: ["student"] }),
+      deps({ simulateRecoveryPermissions: async () => ({ ...ALL_ACTIONS_DENIED }) })
+    );
+    expect(r.ok).toBe(false);
+    const text = r.messages.join("\n");
+    expect(text).toMatch(/none of the recovery actions/i);
+    expect(text).toMatch(/working recovery route/i);
+  }
+});
+
+test("TRI-STATE 4: UNVERIFIED via an incomplete required action -> armed FAILS, watch PASSES with warning", async () => {
+  const simulateRecoveryPermissions = async () => ({
+    ...ALL_ACTIONS_DENIED,
+    "iam:DetachUserPolicy": "incomplete" as const
+  });
+
+  const armed = await runPreflight(
+    cfg({ safety: "armed", denyTargetUsers: ["student"] }),
+    deps({ simulateRecoveryPermissions })
+  );
+  expect(armed.ok).toBe(false);
+  expect(armed.messages.join("\n")).toMatch(/could not be verified/i);
+
+  const watch = await runPreflight(
+    cfg({ safety: "watch", denyTargetUsers: ["student"] }),
+    deps({ simulateRecoveryPermissions })
+  );
+  expect(watch.ok).toBe(true);
+  const watchText = watch.messages.join("\n");
+  expect(watchText).toMatch(/WARNING/);
+  expect(watchText).toMatch(/UNVERIFIED/);
+});
+
+test("TRI-STATE 5: UNVERIFIED via simulation unavailable -> armed FAILS, watch PASSES with warning", async () => {
+  // Covers both flavors of "unavailable": no dep at all, and a dep that throws.
+  const armedNoDep = await runPreflight(cfg({ safety: "armed" }), deps());
+  expect(armedNoDep.ok).toBe(false);
+  expect(armedNoDep.messages.join("\n")).toMatch(/could not be verified/i);
+
+  const watchNoDep = await runPreflight(cfg({ safety: "watch" }), deps());
+  expect(watchNoDep.ok).toBe(true);
+  expect(watchNoDep.messages.join("\n")).toMatch(/WARNING.*UNVERIFIED|UNVERIFIED.*WARNING/is);
+
+  const throwingDep = async () => { throw new Error("no iam:SimulatePrincipalPolicy"); };
+  const armedThrows = await runPreflight(cfg({ safety: "armed" }), deps({ simulateRecoveryPermissions: throwingDep }));
+  expect(armedThrows.ok).toBe(false);
+
+  const watchThrows = await runPreflight(cfg({ safety: "watch" }), deps({ simulateRecoveryPermissions: throwingDep }));
+  expect(watchThrows.ok).toBe(true);
+  expect(watchThrows.messages.join("\n")).toMatch(/UNVERIFIED/);
+});
+
+test("TRI-STATE 6: an irrelevant allowed action does not create a route (only roles targeted, only group-detach allowed)", async () => {
+  const r = await runPreflight(
+    cfg({ denyTargetUsers: [], denyTargetRoles: ["Grader"] }),
+    deps({
+      simulateRecoveryPermissions: async () => ({
+        ...ALL_ACTIONS_DENIED,
+        "iam:DetachGroupPolicy": true // irrelevant: no groups are targeted
+      })
+    })
+  );
+  expect(r.ok).toBe(false);
+  expect(r.messages.join("\n")).not.toMatch(/at least one simulated recovery route is allowed/i);
+});
+
+test("TRI-STATE 7: mixed targets (users AND roles) require ALL types' detach — partial allowed is not a route", async () => {
+  const r = await runPreflight(
+    cfg({ denyTargetUsers: ["student"], denyTargetRoles: ["Grader"] }),
+    deps({
+      simulateRecoveryPermissions: async () => ({
+        ...ALL_ACTIONS_DENIED,
+        "iam:DetachUserPolicy": true // role detach still denied -> direct-detach incomplete... not complete
+      })
+    })
+  );
+  expect(r.ok).toBe(false);
+  expect(r.messages.join("\n")).not.toMatch(/at least one simulated recovery route is allowed/i);
+});
+
+test("TRI-STATE 8: invalid recovery identity still FAILS both safety modes (regression of F3)", async () => {
+  for (const safety of ["watch", "armed"] as const) {
+    const r = await runPreflight(
+      cfg({ safety }),
+      deps({
+        getRole: async () => null, // recovery principal (a role) cannot be resolved
+        simulateRecoveryPermissions: async () => ({ ...ALL_ACTIONS_DENIED, "budgets:ExecuteBudgetAction": true })
+      })
+    );
+    expect(r.ok).toBe(false);
+    expect(r.messages.join("\n")).toMatch(/recovery principal.*could not be resolved/i);
+  }
 });
