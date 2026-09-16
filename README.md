@@ -38,8 +38,26 @@ your recovery/admin principal separate from it.
 
 - Node.js **>= 20**
 - AWS CLI v2, configured with credentials for the target account
-- An **IAM user or role** to run this as (not the root user) — this is also
-  the identity you'll typically list in `IAM_DENY_TARGET_USERS`/`_ROLES`
+- **A dedicated IAM user for your day-to-day learning work — required.**
+  The block only attaches to IAM **users, groups, or roles**. It cannot
+  target the **root user** or IAM Identity Center / SSO roles
+  (`AWSReservedSSO_*`). A brand-new account often has **no IAM user at all**
+  — and if you keep doing your work as root or as your SSO admin, the deny
+  never applies to *you* and Budget Radar protects nothing. Before you
+  continue:
+  1. Sign in as root (or your admin) and open **IAM → Users → Create user**
+     (for example `learning`). Attach the permissions you actually use for
+     coursework (e.g. `PowerUserAccess`). Turn on console access and/or
+     create an access key for the CLI only if you need them — do that
+     yourself and keep the credentials private.
+  2. From now on, do your normal AWS work **as that user** (console and
+     `aws configure`). Radar can't check this for you — an identity you
+     don't actually use is an identity that isn't protected.
+  3. In step 3 you'll put that user's name in `IAM_DENY_TARGET_USERS`.
+  4. Keep a **separate** admin identity (root, or your SSO admin role) that
+     is **not** a deny target. That is your `RECOVERY_PRINCIPAL_ARN` and the
+     identity you run `npm run deploy` as — it must be able to lift the block
+     after the learning user is denied.
 - **The account root must enable "IAM user and role access to Billing
   information" once**, in the root's Billing console under **Account →
   IAM access**. This is an AWS default: it is **OFF** for a brand-new
@@ -70,7 +88,8 @@ Edit `.env`:
   budget — the preflight checks this and fails closed if it isn't.
 - `MONTHLY_BUDGET_USD` — only used when creating a budget. Set to `0.01` if
   you want a tripwire on the very first charge.
-- `IAM_DENY_TARGET_USERS`/`_GROUPS`/`_ROLES` — at least one is required. Use
+- `IAM_DENY_TARGET_USERS`/`_GROUPS`/`_ROLES` — at least one is required.
+  Put the dedicated learning user from §2 here (e.g. `learning`). Use
   names or full ARNs; if an identity lives under a non-root IAM path, you
   must use its full ARN (the preflight rejects a bare name in that case).
 - `RECOVERY_PRINCIPAL_ARN` — a full ARN for a principal that can reverse the
