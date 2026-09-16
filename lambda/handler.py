@@ -9,6 +9,7 @@ No workload or IAM mutation is ever performed here.
 
 import os
 import time
+import codecs
 import datetime as dt
 from urllib.parse import quote
 
@@ -17,8 +18,15 @@ import botocore.config
 
 
 # Bounded connect/read timeouts and retry count so a slow/unreachable region
-# can never consume the whole Lambda budget on its own.
-_BOTO_CONFIG = botocore.config.Config(connect_timeout=5, read_timeout=15, retries={"max_attempts": 2})
+# can never consume the whole Lambda budget on its own. Defined once and reused
+# below (both in _BOTO_CONFIG and in the derived PUBLISH_MARGIN_SECONDS) so the
+# two can never drift apart.
+CONNECT_TIMEOUT_SECONDS = 5
+READ_TIMEOUT_SECONDS = 15
+MAX_ATTEMPTS = 2
+_BOTO_CONFIG = botocore.config.Config(connect_timeout=CONNECT_TIMEOUT_SECONDS,
+                                       read_timeout=READ_TIMEOUT_SECONDS,
+                                       retries={"max_attempts": MAX_ATTEMPTS})
 
 
 def _client(service, region=None):
@@ -47,6 +55,38 @@ class DeadlineExceeded(Exception):
         self.items_so_far = items_so_far
 
 
+class PartialCoverage(Exception):
+    """Raised by an adapter when it collected BOTH successful items and
+    in-band failures (e.g. ECS DescribeServices/DescribeTasks `failures[]`
+    alongside real successes). Distinct from DeadlineExceeded: this always
+    carries an explicit, non-deadline `reason` so the report never conflates
+    "some items failed" with "ran out of scan time"."""
+
+    def __init__(self, items, reason):
+        super().__init__(reason)
+        self.items = items
+        self.reason = reason
+
+
+def _iter_pages(paginator, deadline, items_so_far, **kwargs):
+    """Drive a paginator while checking the scan deadline BEFORE each page is
+    fetched, not after. `for page in paginator.paginate(...)` already fetches
+    a page (a real network call) the moment the loop advances -- a deadline
+    check inside the loop body only ever runs after that fetch has happened,
+    so it can catch an expiry but can't prevent the next request. Checking
+    here, before calling next() on the underlying iterator, actually stops
+    the next page from ever being requested."""
+    it = iter(paginator.paginate(**kwargs))
+    while True:
+        if _past(deadline):
+            raise DeadlineExceeded(items_so_far)
+        try:
+            page = next(it)
+        except StopIteration:
+            return
+        yield page
+
+
 def observe_action_status(account_id, budget_name, action_id):
     """Return (observed_status, observation_iso, action_details).
 
@@ -65,7 +105,8 @@ def observe_action_status(account_id, budget_name, action_id):
             targets.extend(f"{kind[:-1].lower()}:{t}" for t in iam_def.get(kind, []))
         details = {
             "threshold_value": threshold.get("ActionThresholdValue"),
-            "threshold_type": threshold.get("ActionThresholdType"),
+            "threshold_type": threshold.get("ActionThresholdType"),  # PERCENTAGE | ABSOLUTE_VALUE
+            "notification_type": action.get("NotificationType"),  # ACTUAL | FORECASTED -- separate field
             "approval_model": action.get("ApprovalModel"),
             "targets": targets,
         }
@@ -83,10 +124,8 @@ COMPLETE, EMPTY, FAILED, UNSUPPORTED, NOT_SCANNED, PARTIAL = (
 def _ec2_instances(region, deadline=None):
     c = _client("ec2", region)
     lines = []
-    for page in c.get_paginator("describe_instances").paginate(
+    for page in _iter_pages(c.get_paginator("describe_instances"), deadline, lines,
             Filters=[{"Name": "instance-state-name", "Values": ["running", "pending"]}]):
-        if _past(deadline):
-            raise DeadlineExceeded(lines)
         for res in page.get("Reservations", []):
             for inst in res.get("Instances", []):
                 asg_name = next((t.get("Value") for t in inst.get("Tags", [])
@@ -99,9 +138,7 @@ def _ec2_instances(region, deadline=None):
 def _rds_instances(region, deadline=None):
     c = _client("rds", region)
     lines = []
-    for page in c.get_paginator("describe_db_instances").paginate():
-        if _past(deadline):
-            raise DeadlineExceeded(lines)
+    for page in _iter_pages(c.get_paginator("describe_db_instances"), deadline, lines):
         for db in page.get("DBInstances", []):
             lines.append(f"{db['DBInstanceIdentifier']} {db.get('DBInstanceClass', '?')} in {region}")
     return lines
@@ -110,9 +147,7 @@ def _rds_instances(region, deadline=None):
 def _rds_clusters(region, deadline=None):
     c = _client("rds", region)
     lines = []
-    for page in c.get_paginator("describe_db_clusters").paginate():
-        if _past(deadline):
-            raise DeadlineExceeded(lines)
+    for page in _iter_pages(c.get_paginator("describe_db_clusters"), deadline, lines):
         for cluster in page.get("DBClusters", []):
             lines.append(f"{cluster['DBClusterIdentifier']} {cluster.get('EngineMode', '?')} in {region}")
     return lines
@@ -120,9 +155,7 @@ def _rds_clusters(region, deadline=None):
 
 def _list_cluster_arns(c, deadline=None):
     arns = []
-    for page in c.get_paginator("list_clusters").paginate():
-        if _past(deadline):
-            raise DeadlineExceeded(arns)
+    for page in _iter_pages(c.get_paginator("list_clusters"), deadline, arns):
         arns.extend(page.get("clusterArns", []))
     return arns
 
@@ -132,7 +165,10 @@ def _ecs_services(region, deadline=None):
     SUCCESSFUL response can still report failed lookups) are surfaced as
     explicit failure lines, never silently dropped: if every describe came
     back as a failure with nothing successful, this raises so inventory()
-    marks the area FAILED instead of EMPTY."""
+    marks the area FAILED instead of EMPTY. If there is a MIX of successes
+    and failures, this raises PartialCoverage (not a plain return) so
+    inventory() marks the area PARTIAL-for-failures, distinct from a
+    deadline-caused PARTIAL, instead of silently reporting COMPLETE."""
     c = _client("ecs", region)
     lines = []
     failure_lines = []
@@ -144,9 +180,7 @@ def _ecs_services(region, deadline=None):
         if _past(deadline):
             raise DeadlineExceeded(lines)
         service_arns = []
-        for page in c.get_paginator("list_services").paginate(cluster=cluster):
-            if _past(deadline):
-                raise DeadlineExceeded(lines)
+        for page in _iter_pages(c.get_paginator("list_services"), deadline, lines, cluster=cluster):
             service_arns.extend(page.get("serviceArns", []))
         for i in range(0, len(service_arns), 10):  # describe_services caps at 10 per call
             if _past(deadline):
@@ -158,16 +192,20 @@ def _ecs_services(region, deadline=None):
                               f"{svc.get('schedulingStrategy', 'REPLICA')}) in {region}")
             for fail in resp.get("failures", []):
                 failure_lines.append(f"{fail.get('arn', '?')} FAILED: {fail.get('reason', 'unknown')} in {region}")
-    if failure_lines and not lines:
-        raise RuntimeError("ECS DescribeServices returned only failures: " + "; ".join(failure_lines))
-    return lines + failure_lines
+    if failure_lines:
+        if not lines:
+            raise RuntimeError("ECS DescribeServices returned only failures: " + "; ".join(failure_lines))
+        raise PartialCoverage(lines + failure_lines,
+                               "in-band failures reported by DescribeServices; partial results only")
+    return lines
 
 
 def _ecs_tasks(region, deadline=None):
     """Standalone tasks (RunTask), not owned by any ECS service — tasks whose
     startedBy begins with 'ecs-svc/' are service-owned and are filtered out
     here because ecs-services already reports them. In-band `failures[]` are
-    handled the same way as _ecs_services."""
+    handled the same way as _ecs_services, including raising PartialCoverage
+    on a mix of successes and failures."""
     c = _client("ecs", region)
     lines = []
     failure_lines = []
@@ -179,9 +217,7 @@ def _ecs_tasks(region, deadline=None):
         if _past(deadline):
             raise DeadlineExceeded(lines)
         task_arns = []
-        for page in c.get_paginator("list_tasks").paginate(cluster=cluster):
-            if _past(deadline):
-                raise DeadlineExceeded(lines)
+        for page in _iter_pages(c.get_paginator("list_tasks"), deadline, lines, cluster=cluster):
             task_arns.extend(page.get("taskArns", []))
         for i in range(0, len(task_arns), 100):  # describe_tasks caps at 100 per call
             if _past(deadline):
@@ -195,18 +231,24 @@ def _ecs_tasks(region, deadline=None):
                 lines.append(f"{task_id} {task.get('lastStatus', '?')} in {region}")
             for fail in resp.get("failures", []):
                 failure_lines.append(f"{fail.get('arn', '?')} FAILED: {fail.get('reason', 'unknown')} in {region}")
-    if failure_lines and not lines:
-        raise RuntimeError("ECS DescribeTasks returned only failures: " + "; ".join(failure_lines))
-    return lines + failure_lines
+    if failure_lines:
+        if not lines:
+            raise RuntimeError("ECS DescribeTasks returned only failures: " + "; ".join(failure_lines))
+        raise PartialCoverage(lines + failure_lines,
+                               "in-band failures reported by DescribeTasks; partial results only")
+    return lines
 
 
 def _lambda_functions(region, deadline=None):
     c = _client("lambda", region)
     lines = []
-    for page in c.get_paginator("list_functions").paginate():
-        if _past(deadline):
-            raise DeadlineExceeded(lines)
+    for page in _iter_pages(c.get_paginator("list_functions"), deadline, lines):
         for fn in page.get("Functions", []):
+            # Checked before EVERY per-function GetFunctionConcurrency call
+            # (not just at page boundaries) so a deadline crossed mid-page
+            # stops further per-item requests immediately.
+            if _past(deadline):
+                raise DeadlineExceeded(lines)
             name = fn["FunctionName"]
             reserved = c.get_function_concurrency(FunctionName=name).get("ReservedConcurrentExecutions")
             lines.append(f"{name} {fn.get('Runtime', '?')} reserved={reserved} in {region}")
@@ -216,14 +258,13 @@ def _lambda_functions(region, deadline=None):
 def _lambda_provisioned_concurrency(region, deadline=None):
     c = _client("lambda", region)
     lines = []
-    for page in c.get_paginator("list_functions").paginate():
-        if _past(deadline):
-            raise DeadlineExceeded(lines)
+    for page in _iter_pages(c.get_paginator("list_functions"), deadline, lines):
         for fn in page.get("Functions", []):
+            if _past(deadline):
+                raise DeadlineExceeded(lines)
             name = fn["FunctionName"]
-            for pc_page in c.get_paginator("list_provisioned_concurrency_configs").paginate(FunctionName=name):
-                if _past(deadline):
-                    raise DeadlineExceeded(lines)
+            for pc_page in _iter_pages(c.get_paginator("list_provisioned_concurrency_configs"),
+                                        deadline, lines, FunctionName=name):
                 for cfg in pc_page.get("ProvisionedConcurrencyConfigs", []):
                     qualifier = cfg.get("FunctionArn", "").rsplit(":", 1)[-1]
                     allocated = cfg.get("AllocatedProvisionedConcurrentExecutions")
@@ -234,9 +275,7 @@ def _lambda_provisioned_concurrency(region, deadline=None):
 def _sagemaker_notebooks(region, deadline=None):
     c = _client("sagemaker", region)
     lines = []
-    for page in c.get_paginator("list_notebook_instances").paginate():
-        if _past(deadline):
-            raise DeadlineExceeded(lines)
+    for page in _iter_pages(c.get_paginator("list_notebook_instances"), deadline, lines):
         for nb in page.get("NotebookInstances", []):
             lines.append(f"{nb['NotebookInstanceName']} {nb.get('InstanceType', '?')} in {region}")
     return lines
@@ -245,9 +284,7 @@ def _sagemaker_notebooks(region, deadline=None):
 def _sagemaker_endpoints(region, deadline=None):
     c = _client("sagemaker", region)
     lines = []
-    for page in c.get_paginator("list_endpoints").paginate():
-        if _past(deadline):
-            raise DeadlineExceeded(lines)
+    for page in _iter_pages(c.get_paginator("list_endpoints"), deadline, lines):
         for ep in page.get("Endpoints", []):
             lines.append(f"{ep['EndpointName']} {ep.get('EndpointStatus', '?')} in {region}")
     return lines
@@ -266,9 +303,7 @@ def _eips_unattached(region, deadline=None):
 def _load_balancers(region, deadline=None):
     c = _client("elbv2", region)
     lines = []
-    for page in c.get_paginator("describe_load_balancers").paginate():
-        if _past(deadline):
-            raise DeadlineExceeded(lines)
+    for page in _iter_pages(c.get_paginator("describe_load_balancers"), deadline, lines):
         for lb in page.get("LoadBalancers", []):
             lines.append(f"{lb['LoadBalancerName']} {lb.get('Type', '?')} in {region}")
     return lines
@@ -277,9 +312,7 @@ def _load_balancers(region, deadline=None):
 def _ebs_volumes(region, deadline=None):
     c = _client("ec2", region)
     lines = []
-    for page in c.get_paginator("describe_volumes").paginate():
-        if _past(deadline):
-            raise DeadlineExceeded(lines)
+    for page in _iter_pages(c.get_paginator("describe_volumes"), deadline, lines):
         for vol in page.get("Volumes", []):
             lines.append(f"{vol['VolumeId']} {vol.get('Size', '?')}GiB {vol.get('State', '?')} in {region}")
     return lines
@@ -288,9 +321,7 @@ def _ebs_volumes(region, deadline=None):
 def _nat_gateways(region, deadline=None):
     c = _client("ec2", region)
     lines = []
-    for page in c.get_paginator("describe_nat_gateways").paginate():
-        if _past(deadline):
-            raise DeadlineExceeded(lines)
+    for page in _iter_pages(c.get_paginator("describe_nat_gateways"), deadline, lines):
         for gw in page.get("NatGateways", []):
             lines.append(f"{gw['NatGatewayId']} {gw.get('State', '?')} in {region}")
     return lines
@@ -331,9 +362,17 @@ def inventory(regions, deadline_epoch):
                 continue
             try:
                 items = fn(region, deadline_epoch)
+            except PartialCoverage as e:  # some items failed in-band -> PARTIAL, reason distinct from deadline
+                areas.append({"region": region, "service": name, "state": PARTIAL,
+                              "items": e.items, "reason": e.reason})
+                continue
             except DeadlineExceeded as e:  # deadline hit mid-pagination -> preserve partial items
-                state = PARTIAL if e.items_so_far else NOT_SCANNED
-                areas.append({"region": region, "service": name, "state": state, "items": e.items_so_far})
+                if e.items_so_far:
+                    areas.append({"region": region, "service": name, "state": PARTIAL,
+                                  "items": e.items_so_far,
+                                  "reason": "scan deadline reached; partial results only"})
+                else:
+                    areas.append({"region": region, "service": name, "state": NOT_SCANNED, "items": []})
                 continue
             except Exception as e:  # denied/throttled/unavailable -> FAILED, never zero
                 areas.append({"region": region, "service": name, "state": FAILED,
@@ -357,7 +396,15 @@ def _from_trigger_topic(event):
 # --- Report assembly, S3 sizing, byte budget, publish (Task 9) ---
 
 SNS_MAX_BYTES = 262144
-PUBLISH_MARGIN_SECONDS = 30  # reserved off the Lambda's remaining time for build_report()+publish()
+# Worst case for a single boto3 request under _BOTO_CONFIG: every attempt
+# (including retries) can spend up to connect+read seconds before that
+# attempt fails over to the next one.
+WORST_REQUEST_SECONDS = MAX_ATTEMPTS * (CONNECT_TIMEOUT_SECONDS + READ_TIMEOUT_SECONDS)
+# Reserved off the Lambda's remaining time for build_report()/publish(): must
+# cover at least one worst-case (fully retried) request still in flight when
+# the deadline is checked, plus a small allowance for report assembly and the
+# publish() SNS call itself.
+PUBLISH_MARGIN_SECONDS = WORST_REQUEST_SECONDS + 10
 _LOG_CHUNK_BYTES = 200_000  # keep well under typical CloudWatch Logs per-event limits
 
 
@@ -379,7 +426,13 @@ def s3_bucket_sizes(deadline_epoch=None):
     """S3 sizes from daily CloudWatch BucketSizeBytes, queried in each bucket's
     OWN region. Only the StandardStorage class is queried; the label says so
     explicitly so a reader isn't misled that it's the bucket's total size.
-    Never enumerate objects. Honors the scan deadline between buckets."""
+    Never enumerate objects. Honors the scan deadline: checked before
+    ListBuckets even runs, before each bucket's GetBucketLocation, and before
+    each bucket's GetMetricData -- never just at the top of the bucket loop."""
+    if _past(deadline_epoch):
+        # Already past deadline: do not even call ListBuckets.
+        return ["S3 bucket sizing stopped early (scan deadline already reached before it began); "
+                "0 bucket(s) sized."]
     try:
         s3 = _client("s3")
         buckets = s3.list_buckets().get("Buckets", [])
@@ -387,7 +440,7 @@ def s3_bucket_sizes(deadline_epoch=None):
         return [f"S3 bucket sizing unavailable: {e}"]
     lines = []
     for idx, b in enumerate(buckets):
-        if _past(deadline_epoch):
+        if _past(deadline_epoch):  # before GetBucketLocation
             remaining = len(buckets) - idx
             lines.append(f"S3 bucket sizing stopped early (scan deadline reached); "
                           f"{remaining} of {len(buckets)} bucket(s) not sized.")
@@ -397,6 +450,11 @@ def s3_bucket_sizes(deadline_epoch=None):
         if not resolved:
             lines.append(f"s3://{name}: size unknown (bucket region lookup failed)")
             continue
+        if _past(deadline_epoch):  # before GetMetricData
+            remaining = len(buckets) - idx
+            lines.append(f"S3 bucket sizing stopped early (scan deadline reached); "
+                          f"{remaining} of {len(buckets)} bucket(s) not sized.")
+            break
         try:
             cw = _client("cloudwatch", region)
             resp = cw.get_metric_data(MetricDataQueries=[{
@@ -423,10 +481,17 @@ def s3_bucket_sizes(deadline_epoch=None):
 def _log_full_report(body):
     """Emit the full, untruncated report to the Lambda log in bounded chunks
     so the truncation notice's claim ("see CloudWatch Logs for the complete
-    report") is actually true."""
+    report") is actually true. Uses an incremental UTF-8 decoder across chunk
+    boundaries: decoding each byte slice independently (with errors="ignore")
+    would silently drop a multibyte character that happens to be split across
+    two chunks -- the incremental decoder instead buffers the incomplete tail
+    bytes and completes the character once the next chunk arrives."""
     data = body.encode("utf-8")
+    decoder = codecs.getincrementaldecoder("utf-8")()
     for i in range(0, len(data), _LOG_CHUNK_BYTES):
-        print(data[i:i + _LOG_CHUNK_BYTES].decode("utf-8", "ignore"))
+        chunk = data[i:i + _LOG_CHUNK_BYTES]
+        is_last = i + _LOG_CHUNK_BYTES >= len(data)
+        print(decoder.decode(chunk, final=is_last))
 
 
 def _fit(body, limit=SNS_MAX_BYTES):
@@ -448,12 +513,22 @@ def _safety_label(safety):
 
 
 _STATUS_NARRATIVE = {
-    "EXECUTION_SUCCESS": "the configured action WAS applied by AWS Budgets.",
-    "EXECUTION_FAILURE": "the configured action FAILED to apply — no deny is currently in effect. Investigate immediately.",
-    "REVERSE_EXECUTION_SUCCESS": "the action has been reversed; workloads are no longer restricted by it.",
-    "REVERSE_EXECUTION_FAILURE": "an attempt to reverse the action FAILED — the prior state may still be in effect.",
+    # Keys are the real DescribeBudgetAction ActionStatus enum values.
     "STANDBY": "the action is on standby and has not been applied.",
     "PENDING": "the action is pending approval and has not yet been applied.",
+    "EXECUTION_IN_PROGRESS": "AWS Budgets is currently executing the action.",
+    "EXECUTION_SUCCESS": "the configured action WAS applied by AWS Budgets.",
+    # This reporter never inspects policy attachments directly, so it must not
+    # assert what state the deny policy is actually in -- only that AWS
+    # Budgets reports the execution failed.
+    "EXECUTION_FAILURE": ("AWS Budgets reports the action FAILED to execute. The actual attachment/deny "
+                          "state is UNVERIFIED by this reporter — check the AWS Budgets console and the "
+                          "target IAM principals directly. Investigate immediately."),
+    "REVERSE_IN_PROGRESS": "AWS Budgets is currently reversing the action.",
+    "REVERSE_SUCCESS": "the action has been reversed; workloads are no longer restricted by it.",
+    "REVERSE_FAILURE": "an attempt to reverse the action FAILED — the prior state may still be in effect.",
+    "RESET_IN_PROGRESS": "AWS Budgets is currently resetting the action.",
+    "RESET_FAILURE": "an attempt to reset the action FAILED — verify the action's state directly.",
     "UNKNOWN": "the action status could not be determined (the lookup failed or was denied); treat as unverified.",
 }
 
@@ -467,14 +542,22 @@ def _status_narrative(status):
 
 
 def _format_threshold(action_details):
+    """Render BOTH real, distinct DescribeBudgetAction fields: ActionThreshold
+    (ActionThresholdType: PERCENTAGE|ABSOLUTE_VALUE, ActionThresholdValue) and
+    the separate top-level NotificationType (ACTUAL|FORECASTED spend). These
+    must never be conflated -- e.g. "100% (PERCENTAGE) on FORECASTED spend"
+    or "$50 (ABSOLUTE_VALUE) on ACTUAL spend"."""
     if not action_details or action_details.get("threshold_value") is None:
         return "unknown (action lookup failed)"
-    ttype = action_details.get("threshold_type") or "ACTUAL"
+    ttype = action_details.get("threshold_type") or "unknown"
+    ntype = action_details.get("notification_type") or "unknown"
     mode = action_details.get("approval_model") or "unknown"
     value = action_details["threshold_value"]
     if isinstance(value, float) and value.is_integer():
         value = int(value)  # render a whole-number threshold as "100%", not "100.0%"
-    return f"{value}% {ttype} spend; approval mode: {mode}"
+    unit = "%" if ttype == "PERCENTAGE" else ""
+    prefix = "$" if ttype == "ABSOLUTE_VALUE" else ""
+    return f"{prefix}{value}{unit} ({ttype}) on {ntype} spend; approval mode: {mode}"
 
 
 def _format_targets(action_details):
@@ -518,7 +601,7 @@ def build_report(status, status_ts, inv, safety, account_id=None, budget_name=No
         if area["state"] == FAILED:
             head += f" - {area.get('error', '')}"
         if area["state"] == PARTIAL:
-            head += " - scan deadline reached; partial results only"
+            head += f" - {area.get('reason', 'partial results only')}"
         lines.append(head)
         for it in area["items"]:
             lines.append(f"    - {it}")

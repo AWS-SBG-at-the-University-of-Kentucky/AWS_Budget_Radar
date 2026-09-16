@@ -30,6 +30,7 @@ def test_observe_action_status_reads_observed_status(monkeypatch):
     assert ts  # ISO timestamp present
     assert details["threshold_value"] == 100.0
     assert details["threshold_type"] == "PERCENTAGE"
+    assert details["notification_type"] == "ACTUAL"  # real, separate top-level Action field
 
 def test_observe_action_status_unknown_on_failure(monkeypatch):
     def boom(svc, region=None):
@@ -634,7 +635,14 @@ def test_s3_bucket_sizes_stops_at_deadline_mid_scan(monkeypatch):
 
     monkeypatch.setattr(handler.time, "time", fake_time)
 
-    lines = handler.s3_bucket_sizes(deadline_epoch=1.5)  # deadline crosses between the two buckets
+    # Task 15: s3_bucket_sizes() now checks the deadline THREE times per
+    # bucket path (once before GetBucketLocation, once before GetMetricData),
+    # plus once at function entry before ListBuckets -- so the tick sequence
+    # that used to cross the deadline after bucket 1 needs a slightly later
+    # deadline than before to still land the crossing between bucket 1 and
+    # bucket 2: ticks are [entry=1.0, b1-pre-location=2.0, b1-pre-metric=3.0,
+    # b2-pre-location=4.0] -- 3.5 lands past right at the top of bucket 2.
+    lines = handler.s3_bucket_sizes(deadline_epoch=3.5)  # deadline crosses between the two buckets
     assert any("stopped early" in l.lower() for l in lines)
     assert cw_calls["n"] == 1  # only the first bucket was sized before the deadline hit
 
@@ -746,7 +754,11 @@ def test_ecs_services_all_failures_not_reported_as_empty(monkeypatch):
     assert "MISSING" in area.get("error", "")
 
 
-def test_ecs_services_mixed_success_and_failure_both_visible(monkeypatch):
+def test_ecs_services_mixed_success_and_failure_raises_partial_coverage(monkeypatch):
+    """Defect A: a mix of successes and in-band failures must NOT be reported
+    as a plain (COMPLETE-bound) list — it raises PartialCoverage with a
+    failure-specific reason so inventory() marks the area PARTIAL, distinct
+    from a deadline-caused PARTIAL."""
     client = boto3.client("ecs", region_name="us-east-1")
     stub = Stubber(client)
     cluster_arn = "arn:aws:ecs:us-east-1:111122223333:cluster/c1"
@@ -761,9 +773,13 @@ def test_ecs_services_mixed_success_and_failure_both_visible(monkeypatch):
     stub.activate()
     monkeypatch.setattr(handler, "_client", lambda svc, region=None: client)
 
-    lines = handler._ecs_services("us-east-1")
-    assert any("s1" in l and "running" in l for l in lines)
-    assert any("MISSING" in l and bad_arn in l for l in lines)
+    with pytest.raises(handler.PartialCoverage) as exc_info:
+        handler._ecs_services("us-east-1")
+    items = exc_info.value.items
+    assert any("s1" in l and "running" in l for l in items)
+    assert any("MISSING" in l and bad_arn in l for l in items)
+    assert "fail" in exc_info.value.reason.lower()
+    assert "deadline" not in exc_info.value.reason.lower()
 
 
 def test_ecs_tasks_all_failures_not_reported_as_empty(monkeypatch):
@@ -787,7 +803,8 @@ def test_ecs_tasks_all_failures_not_reported_as_empty(monkeypatch):
     assert "MISSING" in area.get("error", "")
 
 
-def test_ecs_tasks_mixed_success_and_failure_both_visible(monkeypatch):
+def test_ecs_tasks_mixed_success_and_failure_raises_partial_coverage(monkeypatch):
+    """Defect A (tasks side): same PartialCoverage contract as ecs-services."""
     client = boto3.client("ecs", region_name="us-east-1")
     stub = Stubber(client)
     cluster_arn = "arn:aws:ecs:us-east-1:111122223333:cluster/c1"
@@ -802,9 +819,45 @@ def test_ecs_tasks_mixed_success_and_failure_both_visible(monkeypatch):
     stub.activate()
     monkeypatch.setattr(handler, "_client", lambda svc, region=None: client)
 
-    lines = handler._ecs_tasks("us-east-1")
-    assert any("abc123" in l and "RUNNING" in l for l in lines)
-    assert any("MISSING" in l and bad_arn in l for l in lines)
+    with pytest.raises(handler.PartialCoverage) as exc_info:
+        handler._ecs_tasks("us-east-1")
+    items = exc_info.value.items
+    assert any("abc123" in l and "RUNNING" in l for l in items)
+    assert any("MISSING" in l and bad_arn in l for l in items)
+    assert "fail" in exc_info.value.reason.lower()
+    assert "deadline" not in exc_info.value.reason.lower()
+
+
+def test_ecs_services_mixed_success_and_failure_inventory_state_is_partial_not_deadline(monkeypatch):
+    """End-to-end through inventory()/build_report(): a mixed ECS area renders
+    as PARTIAL with a failures-related reason -- never COMPLETE, and never
+    worded as a deadline PARTIAL -- while both the running service and the
+    failure line remain visible in the report body."""
+    client = boto3.client("ecs", region_name="us-east-1")
+    stub = Stubber(client)
+    cluster_arn = "arn:aws:ecs:us-east-1:111122223333:cluster/c1"
+    ok_arn = "arn:aws:ecs:us-east-1:111122223333:service/c1/s1"
+    bad_arn = "arn:aws:ecs:us-east-1:111122223333:service/c1/s2"
+    stub.add_response("list_clusters", {"clusterArns": [cluster_arn]}, {})
+    stub.add_response("list_services", {"serviceArns": [ok_arn, bad_arn]}, {"cluster": cluster_arn})
+    stub.add_response("describe_services",
+        {"services": [{"serviceName": "s1", "runningCount": 2}],
+         "failures": [{"arn": bad_arn, "reason": "MISSING"}]},
+        {"cluster": cluster_arn, "services": [ok_arn, bad_arn]})
+    stub.activate()
+    monkeypatch.setattr(handler, "_client", lambda svc, region=None: client)
+    monkeypatch.setattr(handler, "ADAPTERS", {"ecs-services": handler._ecs_services})
+
+    result = handler.inventory(["us-east-1"], deadline_epoch=time.time() + 60)
+    area = result["areas"][0]
+    assert area["state"] == "partial"
+    assert "fail" in area.get("reason", "").lower()
+    assert "deadline" not in area.get("reason", "").lower()
+
+    body = handler.build_report("EXECUTION_SUCCESS", "2026-09-15T00:00:00+00:00", result, "armed")
+    assert "[PARTIAL] ecs-services" in body
+    assert "s1" in body and "running" in body.lower()
+    assert "MISSING" in body and bad_arn in body
 
 
 # --- F8: truncation notice must be truthful (the full body is actually logged) ---
@@ -824,23 +877,86 @@ def test_fit_logs_full_report_before_truncating(capsys):
 
 def test_build_report_execution_failure_does_not_claim_auto_applied_and_has_header_fields():
     inv = {"areas": [], "generated": "2026-09-15T00:00:00+00:00"}
-    action_details = {"threshold_value": 100.0, "threshold_type": "ACTUAL",
+    # Real DescribeBudgetAction shapes: ActionThresholdType is PERCENTAGE or
+    # ABSOLUTE_VALUE (never "ACTUAL" -- that is a NotificationType value, a
+    # separate field entirely).
+    action_details = {"threshold_value": 100.0, "threshold_type": "PERCENTAGE",
+                       "notification_type": "FORECASTED",
                        "approval_model": "AUTOMATIC", "targets": ["user:student"]}
     body = handler.build_report("EXECUTION_FAILURE", "2026-09-15T00:00:00+00:00", inv, "armed",
                                  account_id="111122223333", budget_name="my-budget",
                                  action_details=action_details)
     assert "auto-applied" not in body.lower()
+    assert "no deny" not in body.lower()  # Defect C: reporter never asserts attachment state
+    assert "unverified" in body.lower()
     assert "FAILED" in body
     assert "111122223333" in body
     assert "my-budget" in body
     assert "100" in body and "%" in body
+    assert "PERCENTAGE" in body and "FORECASTED" in body
 
 
 def test_format_threshold_renders_whole_number_without_decimal():
-    assert handler._format_threshold({"threshold_value": 100.0, "threshold_type": "ACTUAL",
+    assert handler._format_threshold({"threshold_value": 100.0, "threshold_type": "PERCENTAGE",
+                                       "notification_type": "FORECASTED",
                                        "approval_model": "AUTOMATIC", "targets": []}).startswith("100%")
-    assert handler._format_threshold({"threshold_value": 87.5, "threshold_type": "ACTUAL",
+    assert handler._format_threshold({"threshold_value": 87.5, "threshold_type": "PERCENTAGE",
+                                       "notification_type": "ACTUAL",
                                        "approval_model": "AUTOMATIC", "targets": []}).startswith("87.5%")
+
+
+def test_format_threshold_renders_both_real_fields_without_conflating_them():
+    """Defect B: ActionThreshold {ActionThresholdType, ActionThresholdValue}
+    and the separate top-level NotificationType must both appear, using the
+    REAL enum values (PERCENTAGE|ABSOLUTE_VALUE and ACTUAL|FORECASTED) --
+    never a fabricated threshold_type like "ACTUAL"."""
+    pct = handler._format_threshold({"threshold_value": 100.0, "threshold_type": "PERCENTAGE",
+                                      "notification_type": "FORECASTED",
+                                      "approval_model": "AUTOMATIC", "targets": []})
+    assert "PERCENTAGE" in pct
+    assert "FORECASTED" in pct
+    assert "100%" in pct
+
+    abs_ = handler._format_threshold({"threshold_value": 50.0, "threshold_type": "ABSOLUTE_VALUE",
+                                       "notification_type": "ACTUAL",
+                                       "approval_model": "MANUAL", "targets": []})
+    assert "ABSOLUTE_VALUE" in abs_
+    assert "ACTUAL" in abs_
+    assert "$50" in abs_
+    assert "PERCENTAGE" not in abs_  # not conflated with the other threshold type
+    assert "FORECASTED" not in abs_  # not conflated with the other notification type
+
+
+# --- Report defect C: EXECUTION_FAILURE wording + real REVERSE enum keys ---
+
+def test_execution_failure_narrative_does_not_claim_no_deny_in_effect():
+    narrative = handler._status_narrative("EXECUTION_FAILURE")
+    assert "no deny" not in narrative.lower()
+    assert "unverified" in narrative.lower()
+
+
+def test_reverse_success_maps_to_real_status_narrative_entry():
+    narrative = handler._status_narrative("REVERSE_SUCCESS")
+    assert narrative == handler._STATUS_NARRATIVE["REVERSE_SUCCESS"]
+    assert "reversed" in narrative.lower()
+
+
+def test_reverse_failure_maps_to_real_status_narrative_entry():
+    narrative = handler._status_narrative("REVERSE_FAILURE")
+    assert narrative == handler._STATUS_NARRATIVE["REVERSE_FAILURE"]
+    assert "failed" in narrative.lower()
+
+
+def test_status_narrative_dict_uses_real_documented_enum_keys():
+    expected_keys = {
+        "STANDBY", "PENDING", "EXECUTION_IN_PROGRESS", "EXECUTION_SUCCESS", "EXECUTION_FAILURE",
+        "REVERSE_IN_PROGRESS", "REVERSE_SUCCESS", "REVERSE_FAILURE",
+        "RESET_IN_PROGRESS", "RESET_FAILURE", "UNKNOWN",
+    }
+    assert expected_keys.issubset(handler._STATUS_NARRATIVE.keys())
+    # The fabricated keys from before Task 15 must be gone.
+    assert "REVERSE_EXECUTION_SUCCESS" not in handler._STATUS_NARRATIVE
+    assert "REVERSE_EXECUTION_FAILURE" not in handler._STATUS_NARRATIVE
 
 
 # --- Coordinator follow-up: guard the bounded client Config against a silent drop ---
@@ -876,3 +992,143 @@ def test_client_passes_bounded_config_to_boto3(monkeypatch):
     throwaway = botocore.config.Config(retries={"max_attempts": 2})
     real_client_fn("ec2", region_name="us-east-1", config=throwaway)
     assert cfg.retries == throwaway.retries
+
+
+# --- Task 15 (corrective 2): F1 -- deadline must bound EVERY request ---
+
+def test_lambda_functions_stops_mid_page_and_stops_calling_concurrency(monkeypatch):
+    """(a) A per-item deadline check must run before EVERY GetFunctionConcurrency
+    call, not just at page boundaries: once the clock crosses the deadline
+    partway through a single page's functions, the adapter must stop
+    immediately, preserve whatever it already collected, and must NOT call
+    GetFunctionConcurrency again for the remaining functions on that page."""
+    client = boto3.client("lambda", region_name="us-east-1")
+    stub = Stubber(client)
+    stub.add_response("list_functions", {"Functions": [
+        {"FunctionName": "fn1", "Runtime": "python3.13"},
+        {"FunctionName": "fn2", "Runtime": "python3.13"},
+        {"FunctionName": "fn3", "Runtime": "python3.13"},
+    ]}, {})
+    stub.add_response("get_function_concurrency", {"ReservedConcurrentExecutions": 5}, {"FunctionName": "fn1"})
+    stub.activate()
+    monkeypatch.setattr(handler, "_client", lambda svc, region=None: client)
+
+    concurrency_calls = {"n": 0}
+    real_get_concurrency = client.get_function_concurrency
+
+    def counting_get_concurrency(*args, **kwargs):
+        concurrency_calls["n"] += 1
+        return real_get_concurrency(*args, **kwargs)
+
+    client.get_function_concurrency = counting_get_concurrency
+
+    clock = {"t": 0.0}
+
+    def fake_time():
+        clock["t"] += 1
+        return clock["t"]
+
+    monkeypatch.setattr(handler.time, "time", fake_time)
+
+    # Ticks: 1.0 = _iter_pages pre-fetch check (not past) -> fetch the one page;
+    # 2.0 = pre-check for fn1 (not past) -> GetFunctionConcurrency(fn1) called;
+    # 3.0 = pre-check for fn2 (past, deadline=2.5) -> raises before any 2nd/3rd call.
+    with pytest.raises(handler.DeadlineExceeded) as exc_info:
+        handler._lambda_functions("us-east-1", deadline=2.5)
+
+    assert exc_info.value.items_so_far == ["fn1 python3.13 reserved=5 in us-east-1"]
+    assert concurrency_calls["n"] == 1  # fn2/fn3 must never have been queried
+
+
+def test_s3_bucket_sizes_already_expired_does_not_call_list_buckets(monkeypatch):
+    """(b) An already-expired deadline must skip ListBuckets entirely --
+    scanning must not even begin -- and still emit an explicit line saying
+    the deadline was reached, rather than silently returning nothing."""
+    def must_not_be_called(svc, region=None):
+        raise AssertionError(f"_client({svc!r}) must not be called once the deadline has passed")
+
+    monkeypatch.setattr(handler, "_client", must_not_be_called)
+    lines = handler.s3_bucket_sizes(deadline_epoch=time.time() - 1)  # already past
+    assert any("deadline" in l.lower() for l in lines)
+
+
+def test_publish_margin_derived_from_shared_timeout_constants_covers_worst_case():
+    """(d) PUBLISH_MARGIN_SECONDS must be derived from the SAME timeout
+    constants used to build _BOTO_CONFIG (so they cannot drift apart), and
+    must be large enough to cover one fully-retried worst-case request."""
+    assert handler.WORST_REQUEST_SECONDS == handler.MAX_ATTEMPTS * (
+        handler.CONNECT_TIMEOUT_SECONDS + handler.READ_TIMEOUT_SECONDS)
+    assert handler.PUBLISH_MARGIN_SECONDS >= handler.WORST_REQUEST_SECONDS
+    # The old fixed 30s margin was smaller than one worst-case retried request
+    # (2 attempts * (5s connect + 15s read) = 40s) -- guard against regressing
+    # to a hardcoded value that happens to look plausible but isn't derived.
+    assert handler.PUBLISH_MARGIN_SECONDS >= handler.MAX_ATTEMPTS * (
+        handler.CONNECT_TIMEOUT_SECONDS + handler.READ_TIMEOUT_SECONDS)
+
+
+def test_handler_publishes_even_when_margin_is_the_binding_constraint(monkeypatch):
+    """(d), continued: with remaining time only slightly larger than the
+    margin, the derived deadline must still leave room for build_report()/
+    publish() to run -- i.e. publish() must still be reached and succeed."""
+    monkeypatch.setenv("TRIGGER_TOPIC_ARN", "arn:aws:sns:us-east-1:111122223333:Trigger")
+    monkeypatch.setenv("ACCOUNT_ID", "111122223333")
+    monkeypatch.setenv("BUDGET_NAME", "b")
+    monkeypatch.setenv("ACTION_ID", "11111111-1111-1111-1111-111111111111")
+    monkeypatch.setenv("REPORT_TOPIC_ARN", "arn:aws:sns:us-east-1:111122223333:Report")
+
+    monkeypatch.setattr(handler, "enabled_regions", lambda: [])
+    monkeypatch.setattr(handler, "observe_action_status",
+                         lambda a, b, c: ("EXECUTION_SUCCESS", "2024-01-01T00:00:00+00:00", None))
+    monkeypatch.setattr(handler, "inventory",
+                         lambda regions, deadline_epoch: {"areas": [], "generated": "2024-01-01T00:00:00+00:00"})
+    monkeypatch.setattr(handler, "s3_bucket_sizes", lambda deadline_epoch=None: [])
+
+    published = {}
+
+    def fake_publish(topic_arn, subject, body):
+        published["called"] = True
+
+    monkeypatch.setattr(handler, "publish", fake_publish)
+
+    class SlowContext:
+        # Remaining time is exactly the worst-case request length plus a
+        # sliver -- the margin must still be enough to derive a valid,
+        # future deadline and reach publish().
+        def get_remaining_time_in_millis(self):
+            return int((handler.WORST_REQUEST_SECONDS + 1) * 1000)
+
+    event = {"Records": [{"Sns": {"TopicArn": "arn:aws:sns:us-east-1:111122223333:Trigger", "Message": "x"}}]}
+    result = handler.handler(event, SlowContext())
+
+    assert result["status"] == "reported"
+    assert published.get("called") is True
+
+
+# --- Report defect D: UTF-8-safe chunked logging ---
+
+def test_log_full_report_preserves_multibyte_char_split_across_chunk_boundary(monkeypatch, capsys):
+    """A naive per-chunk `bytes.decode("utf-8", "ignore")` silently drops a
+    multibyte character whose bytes straddle a chunk boundary. Force a tiny
+    chunk size so a euro sign ("€", 3 UTF-8 bytes) lands exactly on one."""
+    monkeypatch.setattr(handler, "_LOG_CHUNK_BYTES", 10)
+    body = "A" * 9 + "€" + "B" * 9  # euro sign's bytes span the byte-10 boundary
+    handler._log_full_report(body)
+    captured = capsys.readouterr()
+    assert "€" in captured.out  # the euro sign survived intact
+    assert "�" not in captured.out  # no replacement character from a mangled/dropped byte
+    assert "A" * 9 in captured.out
+    # The B's may be split across two print()/chunk boundaries (the euro sign
+    # itself straddles the boundary, shifting where the B run gets cut), so
+    # check the total count rather than requiring one contiguous run.
+    assert captured.out.count("B") == 9
+
+
+def test_log_full_report_preserves_emoji_split_across_chunk_boundary(monkeypatch, capsys):
+    """Same as above with a 4-byte UTF-8 character (an emoji, surrogate pair
+    in UTF-16 but a single 4-byte sequence in UTF-8) to cover a wider split."""
+    monkeypatch.setattr(handler, "_LOG_CHUNK_BYTES", 12)
+    body = "X" * 11 + "\U0001F600" + "Y" * 11  # grinning-face emoji, 4 UTF-8 bytes
+    handler._log_full_report(body)
+    captured = capsys.readouterr()
+    assert "\U0001F600" in captured.out
+    assert "�" not in captured.out
