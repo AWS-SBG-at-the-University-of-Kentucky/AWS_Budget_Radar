@@ -1,6 +1,12 @@
 {
   "name": "aws-budget-radar",
   "version": "0.1.0",
+  "description": "Clone-and-deploy AWS CDK safeguard for personal learning accounts: when a cost budget is breached, it blocks selected creation/start operations by your configured IAM identities and emails a region-wide inventory of what's running. Read-only reporter; never stops or deletes resources; not a hard cap.",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/AWS-SBG-at-the-University-of-Kentucky/AWS_Budget_Radar.git"
+  },
+  "license": "MIT",
   "bin": {
     "budget-radar": "bin/budget-radar.js"
   },

@@ -16,7 +16,7 @@ verify recovery from it.
 - **Passing unit tests (`npm test`, `pytest`) does NOT authorize these
   checks.** 110 Jest tests and 82 pytest tests passing locally means the code
   is internally consistent — it says nothing about what a live AWS account
-  does when a budget action actually fires. Task 1–11 unit coverage and this
+  does when a budget action actually fires. Unit coverage and this
   release gate are separate, non-substitutable forms of verification.
 - Nobody may run any check below — including the "no spurious runs" and
   "bounds" checks that don't obviously look destructive — without a
@@ -192,7 +192,7 @@ confirm, not just unit coverage.
 4. **Time-to-deny on an already-breached budget.** Deploy `SAFETY=armed`
    against a budget that is already at/over the action threshold (the
    scenario the preflight now warns/fails on — see README §6/§9 and
-   preflight's F5 check). Record the observed time from stack creation to
+   preflight's already-breached-budget check). Record the observed time from stack creation to
    the deny actually taking effect (`EXECUTION_SUCCESS`).
 5. **If the Lambda never runs on a real breach**, check the trigger topic's
    resource policy first — specifically the `aws:SourceArn`/`aws:SourceAccount`

@@ -55,7 +55,7 @@ your recovery/admin principal separate from it.
 ## 3. Setup
 
 ```bash
-git clone <this-repo-url>
+git clone https://github.com/AWS-SBG-at-the-University-of-Kentucky/AWS_Budget_Radar.git
 cd AWS_Budget_Radar
 npm install
 cp .env.example .env

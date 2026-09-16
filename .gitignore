@@ -6,3 +6,16 @@ cdk.out/
 *.d.ts
 __pycache__/
 .pytest_cache/
+
+# Design/planning scratch — never needed by students who clone this
+docs/superpowers/
+.superpowers/
+tasks/
+
+# Editor / OS / local
+.DS_Store
+.vscode/
+.idea/
+*.log
+.env.local
+.env.*.local
