@@ -193,6 +193,33 @@ set very low (e.g. the `0.01` tripwire) can still cross its own threshold
 almost immediately once real usage (including Radar's own footprint, see
 §11) starts accruing.
 
+### 6.1 Switching between `watch` and `armed`
+
+The mode is one line in `.env` (`SAFETY=watch` or `SAFETY=armed`), and
+**redeploying is the switch**:
+
+```bash
+npm run deploy
+```
+
+Config is read at synth time, so edit-`.env`-and-redeploy *is* the update
+path. CloudFormation updates a single property on the budget action
+(`ApprovalModel`: `MANUAL` for watch, `AUTOMATIC` for armed) in about half a
+minute; nothing else changes.
+
+|  | `watch` (default) | `armed` |
+|---|---|---|
+| Threshold crossed → | Action goes `PENDING`; email says **"NOTHING IS BLOCKED YET"** + the approve command; waits for you indefinitely | Deny **applies automatically**; email is an after-action report |
+| If you ignore the email | Nothing is ever blocked; resets at the next budget period | You're already blocked; reverse (§7) or wait for the period reset |
+
+The preflight deliberately holds `armed` to a higher bar: it **refuses an
+armed deploy** when the recovery route can't be verified (watch only warns),
+and when the budget is *already over threshold* at deploy time (watch warns;
+armed would be lockout-by-deploy). Recommended arc: run `watch` first, walk
+one real trip through approve → block → reverse with your own hands, and
+only then flip to `armed` — a student's first experience should be an email
+asking permission, not a surprise lockout.
+
 ## 7. Lifting the block
 
 Once the deny is applied (whether via `watch` approval or `armed` auto-apply),
@@ -219,11 +246,20 @@ aws budgets execute-budget-action \
   --execution-type REVERSE_BUDGET_ACTION
 ```
 
-`<ACCOUNT_ID>`, `<BUDGET_NAME>`, and `<ACTION_ID>` are the same identifiers
-the reporter Lambda has (its `ACCOUNT_ID`/`BUDGET_NAME`/`ACTION_ID`
-environment variables) and are echoed in every inventory email's recovery
-line — copy them from there, or from the Budgets console/CLI
-(`aws budgets describe-budget-action ...`).
+**Where to find `<ACCOUNT_ID>`, `<BUDGET_NAME>`, and `<ACTION_ID>`** (any one
+of these, easiest first):
+
+1. **The alert email** — every inventory email contains this command with
+   the values already filled in. Copy-paste it.
+2. **Console: Lambda → Functions → `BudgetRadarStack-Reporter…` →
+   Configuration → Environment variables** — `ACCOUNT_ID`, `BUDGET_NAME`,
+   and `ACTION_ID` are right there.
+3. **CLI discovery from scratch:**
+   ```bash
+   aws budgets describe-budget-actions-for-account --account-id <ACCOUNT_ID>
+   ```
+   lists every action with its `ActionId`, `BudgetName`, current `Status`,
+   and which policy it attaches to whom.
 
 If you're running `SAFETY=watch` and the action is `PENDING` your console
 approval, and you want to apply the deny **now** rather than waiting for the
