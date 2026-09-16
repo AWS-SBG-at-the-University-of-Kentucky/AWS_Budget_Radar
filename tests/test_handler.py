@@ -1,6 +1,7 @@
 import datetime as dt
 import time
 from botocore.stub import Stubber
+import botocore.config
 import boto3
 import handler
 
@@ -765,6 +766,47 @@ def test_ecs_services_mixed_success_and_failure_both_visible(monkeypatch):
     assert any("MISSING" in l and bad_arn in l for l in lines)
 
 
+def test_ecs_tasks_all_failures_not_reported_as_empty(monkeypatch):
+    client = boto3.client("ecs", region_name="us-east-1")
+    stub = Stubber(client)
+    cluster_arn = "arn:aws:ecs:us-east-1:111122223333:cluster/c1"
+    task_arn = "arn:aws:ecs:us-east-1:111122223333:task/c1/abc123"
+    stub.add_response("list_clusters", {"clusterArns": [cluster_arn]}, {})
+    stub.add_response("list_tasks", {"taskArns": [task_arn]}, {"cluster": cluster_arn})
+    stub.add_response("describe_tasks",
+        {"tasks": [], "failures": [{"arn": task_arn, "reason": "MISSING"}]},
+        {"cluster": cluster_arn, "tasks": [task_arn]})
+    stub.activate()
+    monkeypatch.setattr(handler, "_client", lambda svc, region=None: client)
+    monkeypatch.setattr(handler, "ADAPTERS", {"ecs-tasks": handler._ecs_tasks})
+
+    result = handler.inventory(["us-east-1"], deadline_epoch=time.time() + 60)
+    area = result["areas"][0]
+    assert area["state"] != "empty"
+    assert area["state"] == "failed"
+    assert "MISSING" in area.get("error", "")
+
+
+def test_ecs_tasks_mixed_success_and_failure_both_visible(monkeypatch):
+    client = boto3.client("ecs", region_name="us-east-1")
+    stub = Stubber(client)
+    cluster_arn = "arn:aws:ecs:us-east-1:111122223333:cluster/c1"
+    ok_arn = "arn:aws:ecs:us-east-1:111122223333:task/c1/abc123"
+    bad_arn = "arn:aws:ecs:us-east-1:111122223333:task/c1/def456"
+    stub.add_response("list_clusters", {"clusterArns": [cluster_arn]}, {})
+    stub.add_response("list_tasks", {"taskArns": [ok_arn, bad_arn]}, {"cluster": cluster_arn})
+    stub.add_response("describe_tasks",
+        {"tasks": [{"taskArn": ok_arn, "lastStatus": "RUNNING"}],
+         "failures": [{"arn": bad_arn, "reason": "MISSING"}]},
+        {"cluster": cluster_arn, "tasks": [ok_arn, bad_arn]})
+    stub.activate()
+    monkeypatch.setattr(handler, "_client", lambda svc, region=None: client)
+
+    lines = handler._ecs_tasks("us-east-1")
+    assert any("abc123" in l and "RUNNING" in l for l in lines)
+    assert any("MISSING" in l and bad_arn in l for l in lines)
+
+
 # --- F8: truncation notice must be truthful (the full body is actually logged) ---
 
 def test_fit_logs_full_report_before_truncating(capsys):
@@ -792,3 +834,45 @@ def test_build_report_execution_failure_does_not_claim_auto_applied_and_has_head
     assert "111122223333" in body
     assert "my-budget" in body
     assert "100" in body and "%" in body
+
+
+def test_format_threshold_renders_whole_number_without_decimal():
+    assert handler._format_threshold({"threshold_value": 100.0, "threshold_type": "ACTUAL",
+                                       "approval_model": "AUTOMATIC", "targets": []}).startswith("100%")
+    assert handler._format_threshold({"threshold_value": 87.5, "threshold_type": "ACTUAL",
+                                       "approval_model": "AUTOMATIC", "targets": []}).startswith("87.5%")
+
+
+# --- Coordinator follow-up: guard the bounded client Config against a silent drop ---
+
+def test_client_passes_bounded_config_to_boto3(monkeypatch):
+    real_client_fn = handler.boto3.client  # saved before patching, used below to reference-check retries
+    captured = []
+
+    def fake_boto3_client(service, **kwargs):
+        captured.append((service, kwargs))
+        return object()
+
+    monkeypatch.setattr(handler.boto3, "client", fake_boto3_client)
+
+    handler._client("ec2")
+    handler._client("s3", "eu-west-1")
+
+    assert len(captured) == 2
+    for service, kwargs in captured:
+        assert kwargs.get("config") is handler._BOTO_CONFIG
+    assert captured[0] == ("ec2", {"config": handler._BOTO_CONFIG})
+    assert captured[1] == ("s3", {"region_name": "eu-west-1", "config": handler._BOTO_CONFIG})
+
+    cfg = handler._BOTO_CONFIG
+    assert cfg.connect_timeout == 5
+    assert cfg.read_timeout == 15
+    # botocore normalizes (and mutates in place) a Config's `retries` dict the first
+    # time it's used to build a real client -- other tests in this session may have
+    # already done that to this same shared singleton, so a literal
+    # {"max_attempts": 2} equality check here would be test-order-dependent. Push an
+    # equivalent throwaway Config through the same real normalization path instead,
+    # then compare shapes -- robust regardless of what state _BOTO_CONFIG is in.
+    throwaway = botocore.config.Config(retries={"max_attempts": 2})
+    real_client_fn("ec2", region_name="us-east-1", config=throwaway)
+    assert cfg.retries == throwaway.retries

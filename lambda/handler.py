@@ -471,7 +471,10 @@ def _format_threshold(action_details):
         return "unknown (action lookup failed)"
     ttype = action_details.get("threshold_type") or "ACTUAL"
     mode = action_details.get("approval_model") or "unknown"
-    return f"{action_details['threshold_value']}% {ttype} spend; approval mode: {mode}"
+    value = action_details["threshold_value"]
+    if isinstance(value, float) and value.is_integer():
+        value = int(value)  # render a whole-number threshold as "100%", not "100.0%"
+    return f"{value}% {ttype} spend; approval mode: {mode}"
 
 
 def _format_targets(action_details):
