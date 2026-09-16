@@ -351,7 +351,7 @@ test("F4: adaptBudgetForPreflight maps a realistic DescribeBudget SDK response",
     },
     CostFilters: {},
     BillingViewArn: "arn:aws:billing::111122223333:billingview/primary",
-    HealthStatus: { Status: "OK" }
+    HealthStatus: { Status: "HEALTHY" }
   };
   const mapped = adaptBudgetForPreflight(raw);
   expect(mapped).toEqual({
@@ -377,7 +377,7 @@ test("F4: adaptBudgetForPreflight flags a future-start, custom-billing-view, unh
       End: new Date(Date.now() + 30 * 24 * 3600 * 1000).toISOString()
     },
     BillingViewArn: "arn:aws:billing::111122223333:billingview/custom-view-id",
-    HealthStatus: { Status: "ERROR" }
+    HealthStatus: { Status: "UNHEALTHY" }
   };
   const mapped = adaptBudgetForPreflight(raw);
   expect(mapped.futureStart).toBe(true);
@@ -395,7 +395,41 @@ test("F4: a valid monthly-USD-cost active whole-account budget (via the realisti
       End: new Date(Date.now() + 30 * 24 * 3600 * 1000).toISOString()
     },
     BillingViewArn: "arn:aws:billing::111122223333:billingview/primary",
-    HealthStatus: { Status: "OK" }
+    HealthStatus: { Status: "HEALTHY" }
+  };
+  const mapped = adaptBudgetForPreflight(raw);
+  const r = await runPreflight(cfg({ existingBudgetName: "B" }), deps({
+    describeBudget: async () => mapped
+  }));
+  expect(r.ok).toBe(true);
+});
+
+test("F4: adaptBudgetForPreflight does not mark a budget with no HealthStatus field as unhealthy", () => {
+  const raw = {
+    BudgetType: "COST",
+    TimeUnit: "MONTHLY",
+    BudgetLimit: { Amount: "25.50", Unit: "USD" },
+    TimePeriod: {
+      Start: new Date(Date.now() - 24 * 3600 * 1000).toISOString(),
+      End: new Date(Date.now() + 30 * 24 * 3600 * 1000).toISOString()
+    },
+    BillingViewArn: "arn:aws:billing::111122223333:billingview/primary"
+    // HealthStatus intentionally omitted — real budgets can lack it.
+  };
+  const mapped = adaptBudgetForPreflight(raw);
+  expect(mapped.unhealthy).toBe(false);
+});
+
+test("F4: a budget with no HealthStatus field still passes preflight (not wrongly failed)", async () => {
+  const raw = {
+    BudgetType: "COST",
+    TimeUnit: "MONTHLY",
+    BudgetLimit: { Amount: "25.50", Unit: "USD" },
+    TimePeriod: {
+      Start: new Date(Date.now() - 24 * 3600 * 1000).toISOString(),
+      End: new Date(Date.now() + 30 * 24 * 3600 * 1000).toISOString()
+    },
+    BillingViewArn: "arn:aws:billing::111122223333:billingview/primary"
   };
   const mapped = adaptBudgetForPreflight(raw);
   const r = await runPreflight(cfg({ existingBudgetName: "B" }), deps({

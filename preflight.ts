@@ -129,8 +129,12 @@ export function adaptBudgetForPreflight(b: any): {
   // total account cost, so it's treated the same as a scoped cost filter.
   const billingViewArn: string | undefined = b?.BillingViewArn;
   const nonDefaultBillingView = !!billingViewArn && !/:billingview\/primary$/i.test(billingViewArn);
+  // AWS Budgets' HealthStatusValue enum is only "HEALTHY" / "UNHEALTHY" (see
+  // @aws-sdk/client-budgets' enums.d.ts) — there is no "OK". Only an
+  // explicit UNHEALTHY value should fail; a missing/empty HealthStatus (or
+  // a genuinely HEALTHY one) must NOT be treated as unhealthy.
   const healthStatusRaw = b?.HealthStatus?.Status ?? b?.HealthStatus;
-  const unhealthy = typeof healthStatusRaw === "string" && healthStatusRaw.toUpperCase() !== "OK";
+  const unhealthy = typeof healthStatusRaw === "string" && healthStatusRaw.toUpperCase() === "UNHEALTHY";
   return {
     BudgetType: b?.BudgetType, TimeUnit: b?.TimeUnit, unit: b?.BudgetLimit?.Unit,
     scoped, expired, futureStart, amount, nonDefaultBillingView, unhealthy
