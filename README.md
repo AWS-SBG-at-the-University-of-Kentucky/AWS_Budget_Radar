@@ -381,6 +381,16 @@ Near-zero — **not guaranteed $0.00**:
 On a `0.01` tripwire, Radar's own footprint (logs, requests) can eventually
 be the thing that trips it. That's the tripwire working, not a bug.
 
+> **Watch your budget on the Budgets page — not Cost Explorer.** The Cost
+> Explorer **API costs $0.01 per request**, and both the `aws ce
+> get-cost-and-usage` CLI command and the console's "Cost and usage" /
+> Cost Explorer widgets issue those requests. If you set a tiny tripwire
+> (e.g. `$0.01`) and then anxiously refresh Cost Explorer to watch it,
+> **the checking itself can be what trips the budget.** To watch spend for
+> free, use **Billing → Budgets** (your budget's "Current spend" is exactly
+> what the action evaluates) — the Budgets API and page are not billed
+> per request.
+
 ## Troubleshooting
 
 **Preflight refused to deploy.** That's it working. The message names the
