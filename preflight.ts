@@ -288,11 +288,30 @@ export async function runPreflight(config: RadarConfig, deps: PreflightDeps): Pr
       `(MONTHLY_BUDGET_USD ${config.monthlyBudgetUsd} x ACTION_THRESHOLD_PERCENT ${config.actionThresholdPercent}%).`
     );
   }
-  info(
-    "Deploy summary: AWS Budgets evaluates cost using your budget's configured cost metric (unblended by " +
-    "default), which reflects credits/refunds/RI-DR amortization according to that setting — actual spend as " +
-    "shown elsewhere (e.g. the Bills page) can differ, and credits can delay or suppress a threshold crossing."
-  );
+  if (config.existingBudgetName) {
+    info(
+      "Deploy summary: cost-metric treatment is the EXISTING budget's own setting (this tool never rewrites it). " +
+      "If it includes credits/refunds (the AWS default), credits can delay or suppress a threshold crossing on a " +
+      "credit-covered account — the Bills page can differ from what the budget evaluates."
+    );
+  } else if (config.trackGrossUsage) {
+    info(
+      "Deploy summary: cost-metric treatment = GROSS usage (TRACK_GROSS_USAGE=true) — AWS credits & refunds are " +
+      "EXCLUDED, so real usage trips the budget even while credits cover the bill (recommended for learning accounts)."
+    );
+  } else {
+    info(
+      "Deploy summary: cost-metric treatment = NET of credits (TRACK_GROSS_USAGE=false) — AWS credits & refunds are " +
+      "included, so credit-covered usage can read ~$0.00 and delay or suppress a threshold crossing."
+    );
+  }
+  if (!config.existingBudgetName && config.excludeServices.length > 0) {
+    info(
+      `Deploy summary: budget is SCOPED to exclude ${config.excludeServices.length} service(s) ` +
+      `(${config.excludeServices.join(", ")}) — it tracks everything EXCEPT these, so it no longer protects ` +
+      "TOTAL account cost. Spend on an excluded service will NOT trip this budget."
+    );
+  }
   info(
     "Deploy summary: expect a near-zero, but not exactly $0.00, baseline even at rest (minor storage/request " +
     "charges are normal) — a literal $0.00 bill is not guaranteed and its absence does not indicate a problem."

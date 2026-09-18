@@ -91,6 +91,32 @@ test("same name, different identity type: role recovery 'Admin' vs user target '
   expect(c.denyTargetUsers).toContain("Admin");
 });
 
+test("TRACK_GROSS_USAGE defaults to true (ignore credits) when unset", () => {
+  expect(loadConfig({ ...base } as any).trackGrossUsage).toBe(true);
+});
+
+test("TRACK_GROSS_USAGE=false opts back into net-of-credits", () => {
+  expect(loadConfig({ ...base, TRACK_GROSS_USAGE: "false" } as any).trackGrossUsage).toBe(false);
+  expect(loadConfig({ ...base, TRACK_GROSS_USAGE: "FALSE" } as any).trackGrossUsage).toBe(false);
+});
+
+test("TRACK_GROSS_USAGE accepts true (case-insensitive)", () => {
+  expect(loadConfig({ ...base, TRACK_GROSS_USAGE: "True" } as any).trackGrossUsage).toBe(true);
+});
+
+test("rejects an invalid TRACK_GROSS_USAGE", () => {
+  expect(() => loadConfig({ ...base, TRACK_GROSS_USAGE: "yes" } as any)).toThrow(/TRACK_GROSS_USAGE/);
+});
+
+test("EXCLUDE_SERVICES defaults to empty (unscoped, protects total cost)", () => {
+  expect(loadConfig({ ...base } as any).excludeServices).toEqual([]);
+});
+
+test("parses EXCLUDE_SERVICES as a trimmed, comma-separated list", () => {
+  const c = loadConfig({ ...base, EXCLUDE_SERVICES: "AWS Cost Explorer, Amazon Simple Storage Service" } as any);
+  expect(c.excludeServices).toEqual(["AWS Cost Explorer", "Amazon Simple Storage Service"]);
+});
+
 test("parses SERVICE_BUDGETS list", () => {
   const c = loadConfig({ ...base, SERVICE_BUDGETS: "Amazon Elastic Compute Cloud - Compute:20,Amazon SageMaker:10" } as any);
   expect(c.serviceBudgets).toEqual([

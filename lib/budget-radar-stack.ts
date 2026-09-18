@@ -133,6 +133,47 @@ export class BudgetRadarStack extends cdk.Stack {
     // construct tree shifts.
     const budgetName = config.existingBudgetName ?? `budget-radar-${this.stackName}-${this.region}`;
 
+    // Cost-metric treatment (design spec §5.6). AWS's default includes credits &
+    // refunds, which nets a credit-covered learning account's gross usage down to
+    // ~$0.00 and hides it behind a tiny threshold — so a $0.06 spend read $0.00
+    // and the action never tripped. trackGrossUsage (default) excludes credits &
+    // refunds so real usage trips the budget even while credits cover the bill.
+    // Only these two fields are overridden; the rest stay at AWS defaults. Used by
+    // budgets that stay on the classic model (per-service warn budgets, and the
+    // main budget when no services are excluded).
+    const grossCostTypes = config.trackGrossUsage
+      ? { includeCredit: false, includeRefund: false }
+      : undefined;
+
+    // The action-enabled budget's cost scope. Two mutually exclusive AWS models:
+    //   - No EXCLUDE_SERVICES: unscoped total-account cost via the classic model
+    //     (CostTypes carries the gross-usage treatment above).
+    //   - EXCLUDE_SERVICES set: a FilterExpression tracking everything EXCEPT the
+    //     named services. AWS DROPS CostTypes whenever FilterExpression is present
+    //     (verified empirically), so gross-usage is preserved instead by excluding
+    //     Credit/Refund RECORD_TYPEs and pinning the UnblendedCost (pre-credit)
+    //     metric. Note: excluding a service makes the budget scoped, so it no
+    //     longer protects TOTAL account cost (opt-in only; default is empty).
+    const mainBudgetScope: {
+      costTypes?: cdk.aws_budgets.CfnBudget.CostTypesProperty;
+      filterExpression?: cdk.aws_budgets.CfnBudget.ExpressionProperty;
+      metrics?: string[];
+    } = {};
+    if (config.excludeServices.length === 0) {
+      mainBudgetScope.costTypes = grossCostTypes;
+    } else {
+      const notService = (name: string): cdk.aws_budgets.CfnBudget.ExpressionProperty => ({
+        not: { dimensions: { key: "SERVICE", values: [name], matchOptions: ["EQUALS"] } }
+      });
+      const clauses: cdk.aws_budgets.CfnBudget.ExpressionProperty[] =
+        config.excludeServices.map(notService);
+      if (config.trackGrossUsage) {
+        clauses.push({ not: { dimensions: { key: "RECORD_TYPE", values: ["Credit", "Refund"], matchOptions: ["EQUALS"] } } });
+      }
+      mainBudgetScope.filterExpression = clauses.length === 1 ? clauses[0] : { and: clauses };
+      mainBudgetScope.metrics = ["UnblendedCost"];
+    }
+
     let budget: cdk.aws_budgets.CfnBudget | undefined;
     if (!config.existingBudgetName) {
       const notifications = [
@@ -147,7 +188,8 @@ export class BudgetRadarStack extends cdk.Stack {
           budgetName,
           budgetType: "COST",
           timeUnit: "MONTHLY",
-          budgetLimit: { amount: config.monthlyBudgetUsd, unit: "USD" }
+          budgetLimit: { amount: config.monthlyBudgetUsd, unit: "USD" },
+          ...mainBudgetScope
         },
         notificationsWithSubscribers: notifications
       });
@@ -195,7 +237,8 @@ export class BudgetRadarStack extends cdk.Stack {
           budgetType: "COST",
           timeUnit: "MONTHLY",
           budgetLimit: { amount: sb.limitUsd, unit: "USD" },
-          costFilters: { Service: [sb.service] }
+          costFilters: { Service: [sb.service] },
+          costTypes: grossCostTypes
         },
         notificationsWithSubscribers: [{
           notification: { notificationType: "ACTUAL", comparisonOperator: "GREATER_THAN", threshold: 100 },

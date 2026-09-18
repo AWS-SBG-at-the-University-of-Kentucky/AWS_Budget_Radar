@@ -7,7 +7,8 @@ const cfg: RadarConfig = {
   alertEmail: "a@b.edu", existingBudgetName: undefined, monthlyBudgetUsd: 5,
   warnAtPercent: 80, actionThresholdPercent: 100, actionThresholdType: "ACTUAL",
   safety: "watch", denyTargetUsers: ["student"], denyTargetGroups: [], denyTargetRoles: [],
-  recoveryPrincipalArn: "arn:aws:iam::111122223333:role/Admin", serviceBudgets: []
+  recoveryPrincipalArn: "arn:aws:iam::111122223333:role/Admin", serviceBudgets: [],
+  trackGrossUsage: true, excludeServices: []
 };
 
 function synth(config: RadarConfig): Template {
@@ -133,6 +134,64 @@ test("Path B creates a monthly USD cost budget and one action", () => {
     Budget: Match.objectLike({ BudgetType: "COST", TimeUnit: "MONTHLY", BudgetLimit: { Amount: 5, Unit: "USD" } })
   }));
   t.resourceCountIs("AWS::Budgets::BudgetsAction", 1);
+});
+
+test("trackGrossUsage (default) excludes credits & refunds so credits can't hide usage", () => {
+  const t = synth(cfg);
+  t.hasResourceProperties("AWS::Budgets::Budget", Match.objectLike({
+    Budget: Match.objectLike({ CostTypes: Match.objectLike({ IncludeCredit: false, IncludeRefund: false }) })
+  }));
+});
+
+test("trackGrossUsage=false leaves CostTypes at AWS defaults (net of credits)", () => {
+  const budgets = synth({ ...cfg, trackGrossUsage: false }).findResources("AWS::Budgets::Budget");
+  const main = Object.values(budgets)[0].Properties.Budget;
+  expect(main.CostTypes).toBeUndefined();
+});
+
+// Selects the main action-enabled budget (the one that is NOT a per-service
+// warn budget). Per-service budgets carry CostFilters; the main one does not.
+function mainBudget(t: Template): any {
+  const all = Object.values(t.findResources("AWS::Budgets::Budget")).map(r => r.Properties.Budget);
+  return all.find(b => !b.CostFilters);
+}
+
+test("EXCLUDE_SERVICES switches to a FilterExpression that excludes those services + UnblendedCost metric, no CostTypes", () => {
+  const b = mainBudget(synth({ ...cfg, excludeServices: ["Some AWS Service"] }));
+  expect(b.CostTypes).toBeUndefined();               // AWS drops CostTypes under FilterExpression
+  expect(b.Metrics).toEqual(["UnblendedCost"]);
+  const clauses = b.FilterExpression.And;
+  const serviceNot = clauses.find((c: any) => c.Not?.Dimensions?.Key === "SERVICE");
+  expect(serviceNot.Not.Dimensions.Values).toEqual(["Some AWS Service"]);
+  expect(serviceNot.Not.Dimensions.MatchOptions).toEqual(["EQUALS"]);
+});
+
+test("gross-usage under exclusion is preserved via a RECORD_TYPE credit/refund exclusion", () => {
+  const b = mainBudget(synth({ ...cfg, excludeServices: ["Some AWS Service"], trackGrossUsage: true }));
+  const recordNot = b.FilterExpression.And.find((c: any) => c.Not?.Dimensions?.Key === "RECORD_TYPE");
+  expect(recordNot.Not.Dimensions.Values).toEqual(expect.arrayContaining(["Credit", "Refund"]));
+});
+
+test("trackGrossUsage=false under exclusion omits the RECORD_TYPE clause", () => {
+  const b = mainBudget(synth({ ...cfg, excludeServices: ["Some AWS Service"], trackGrossUsage: false }));
+  const hasRecordType = (b.FilterExpression.And ?? [b.FilterExpression])
+    .some((c: any) => c.Not?.Dimensions?.Key === "RECORD_TYPE");
+  expect(hasRecordType).toBe(false);
+});
+
+test("multiple excluded services each get their own Not(SERVICE=...) clause", () => {
+  const b = mainBudget(synth({ ...cfg, excludeServices: ["Service A", "Service B"] }));
+  const svc = b.FilterExpression.And
+    .filter((c: any) => c.Not?.Dimensions?.Key === "SERVICE")
+    .map((c: any) => c.Not.Dimensions.Values[0]);
+  expect(svc).toEqual(expect.arrayContaining(["Service A", "Service B"]));
+});
+
+test("per-service budgets share the gross-usage cost treatment", () => {
+  const t = synth({ ...cfg, serviceBudgets: [{ service: "Amazon Elastic Compute Cloud - Compute", limitUsd: 20 }] });
+  const budgets = t.findResources("AWS::Budgets::Budget");
+  const svc = Object.values(budgets).find(b => b.Properties.Budget.CostFilters)!.Properties.Budget;
+  expect(svc.CostTypes).toEqual(expect.objectContaining({ IncludeCredit: false, IncludeRefund: false }));
 });
 
 test("Path A creates the action but NO budget", () => {

@@ -14,6 +14,20 @@ export interface RadarConfig {
   denyTargetRoles: string[];
   recoveryPrincipalArn: string;
   serviceBudgets: ServiceBudget[];
+  // When true (default), the budget counts GROSS usage — AWS credits and
+  // refunds are EXCLUDED from CostTypes — so usage trips the budget even while
+  // credits cover the bill. AWS's default (credits included) can hide gross
+  // usage behind a small net threshold on a credit-covered learning account
+  // (design spec §5.6). false opts back into net-of-credits.
+  trackGrossUsage: boolean;
+  // Optional list of AWS service names to EXCLUDE from the action-enabled
+  // budget (exact SERVICE dimension values, e.g. "AWS Cost Explorer"). Empty
+  // by default, which keeps the budget unscoped and protecting TOTAL account
+  // cost. When non-empty the budget switches to a FilterExpression tracking
+  // everything except these services (AWS drops CostTypes under that model, so
+  // gross-usage is preserved via a RECORD_TYPE credit/refund exclusion +
+  // UnblendedCost metric in the stack).
+  excludeServices: string[];
 }
 
 function list(v?: string): string[] {
@@ -89,6 +103,15 @@ export function loadConfig(env: NodeJS.ProcessEnv): RadarConfig {
     return n;
   };
 
+  const bool = (name: string, v: string | undefined, dflt: boolean): boolean => {
+    if (v === undefined || v.trim() === "") return dflt;
+    const s = v.trim().toLowerCase();
+    if (s === "true") return true;
+    if (s === "false") return false;
+    throw new Error(`${name} must be "true" or "false". Got: ${v}`);
+  };
+  const trackGrossUsage = bool("TRACK_GROSS_USAGE", env.TRACK_GROSS_USAGE, true);
+
   const existingBudgetName = (env.EXISTING_BUDGET_NAME ?? "").trim() || undefined;
   const monthlyBudgetUsd = existingBudgetName ? 0 : num("MONTHLY_BUDGET_USD", env.MONTHLY_BUDGET_USD, 0.01, 1e9);
   const warnAtPercent = num("WARN_AT_PERCENT", env.WARN_AT_PERCENT ?? "80", 1, 99);
@@ -109,6 +132,7 @@ export function loadConfig(env: NodeJS.ProcessEnv): RadarConfig {
     alertEmail: email, existingBudgetName, monthlyBudgetUsd, warnAtPercent,
     actionThresholdPercent, actionThresholdType: thresholdType, safety,
     denyTargetUsers: users, denyTargetGroups: groups, denyTargetRoles: roles,
-    recoveryPrincipalArn: recovery, serviceBudgets
+    recoveryPrincipalArn: recovery, serviceBudgets, trackGrossUsage,
+    excludeServices: list(env.EXCLUDE_SERVICES)
   };
 }

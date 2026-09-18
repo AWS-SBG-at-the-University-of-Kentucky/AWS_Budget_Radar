@@ -15,6 +15,8 @@ function cfg(overrides: Partial<RadarConfig> = {}): RadarConfig {
     denyTargetRoles: [],
     recoveryPrincipalArn: "arn:aws:iam::111122223333:role/Admin",
     serviceBudgets: [],
+    trackGrossUsage: true,
+    excludeServices: [],
     ...overrides
   };
 }
