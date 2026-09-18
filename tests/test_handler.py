@@ -1183,6 +1183,20 @@ def test_pending_report_contains_approve_cli():
     assert handler._approve_cli("111122223333", "my-budget", "aaaa-bbbb") in body
 
 
+def test_report_puts_stop_spend_action_before_reverse_command():
+    # The actionable stop-spend (approve) command comes first; the reverse/undo
+    # command is the recovery route at the bottom of the report.
+    inv = {"areas": [], "generated": "2026-09-15T00:00:00+00:00"}
+    body = handler.build_report(
+        "PENDING", "2026-09-15T00:00:00+00:00", inv, "watch",
+        account_id="111122223333", budget_name="my-budget", action_id="aaaa-bbbb"
+    )
+    approve = handler._approve_cli("111122223333", "my-budget", "aaaa-bbbb")
+    reverse = handler._reverse_cli("111122223333", "my-budget", "aaaa-bbbb")
+    assert approve in body and reverse in body
+    assert body.index(approve) < body.index(reverse)
+
+
 # --- F3: subject/headline derived from the OBSERVED status ---
 
 def test_report_subject_pending_and_execution_statuses():
@@ -1239,10 +1253,11 @@ def test_call_to_action_pending_says_nothing_blocked_yet_with_approve_cli():
     assert handler._approve_cli("111122223333", "my-budget", "aaaa-bbbb") in text
 
 
-def test_call_to_action_execution_success_says_block_applied_with_reverse_cli():
+def test_call_to_action_execution_success_says_block_applied_without_inline_reverse_cli():
     text = handler._call_to_action("EXECUTION_SUCCESS", "111122223333", "my-budget", "aaaa-bbbb")
     assert "block is applied" in text.lower()
-    assert handler._reverse_cli("111122223333", "my-budget", "aaaa-bbbb") in text
+    # The reverse/undo command now lives in the report footer, not inline here.
+    assert handler._reverse_cli("111122223333", "my-budget", "aaaa-bbbb") not in text
 
 
 def test_call_to_action_reverse_success_and_standby_say_no_block_in_effect():

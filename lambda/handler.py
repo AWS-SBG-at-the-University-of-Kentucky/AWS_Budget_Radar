@@ -541,19 +541,17 @@ def _approve_cli(account_id, budget_name, action_id):
 def _call_to_action(status, account_id, budget_name, action_id):
     """F4: the report's call-to-action is conditional on the OBSERVED status
     -- never claim "to lift the block" when nothing is applied, and never
-    stay silent about how to approve a PENDING action under watch mode."""
+    stay silent about how to approve a PENDING action under watch mode. The
+    reverse/undo command is shown separately in the report footer."""
     if not (account_id and budget_name and action_id):
         return ("Call to action unavailable (account/budget/action identifiers missing); check the AWS Budgets "
                 "console directly for the current action state.")
     approve_cli = _approve_cli(account_id, budget_name, action_id)
-    reverse_cli = _reverse_cli(account_id, budget_name, action_id)
     if status == "PENDING":
-        return ("NOTHING IS BLOCKED YET. If you want the block applied now (SAFETY=watch is waiting on your "
-                f"approval), approve it by running:\n    {approve_cli}\n"
-                "(or use the AWS Budgets console -- note the console page requires the account root to have "
-                "enabled \"IAM user and role access to Billing information\"; the CLI above works regardless).")
+        return ("NOTHING IS BLOCKED YET (watch mode is waiting for your approval). To apply the block now and "
+                f"stop new spend, run:\n\n    {approve_cli}\n\n(or approve it in the Budgets console).")
     if status == "EXECUTION_SUCCESS":
-        return f"The block is applied. To lift it, run:\n    {reverse_cli}"
+        return "The block is applied -- new spend is denied for the covered identities (reverse command below)."
     if status in ("REVERSE_SUCCESS", "STANDBY"):
         return "No block is in effect."
     return ("Status does not map to a specific call to action; check the AWS Budgets console directly for the "
@@ -649,24 +647,17 @@ def build_report(status, status_ts, inv, safety, account_id=None, budget_name=No
     lines.append(f"Action threshold: {_format_threshold(action_details)}")
     lines.append(f"Covered identities (deny targets): {_format_targets(action_details)}")
     lines.append(f"View/manage in the AWS Budgets console: {_budgets_console_url(account_id, budget_name)}")
-    lines.append("NOTE: the Budgets/Billing console pages above only work for an IAM user/role once the account "
-                  "root has enabled \"IAM user and role access to Billing information\" (off by default) -- the "
-                  "AWS CLI commands below work regardless of that setting.")
-    # F1(c): name the actual configured recovery principal instead of the
-    # generic "RECOVERY_PRINCIPAL_ARN... see README" wording, when known.
-    recovery_who = recovery_principal_arn or (
-        "the recovery principal configured at deploy time (RECOVERY_PRINCIPAL_ARN; see README)"
-    )
-    if account_id and budget_name and action_id:
-        lines.append(f"To reverse the action: assume {recovery_who} and detach the deny policy, or run:")
-        lines.append(f"    {_reverse_cli(account_id, budget_name, action_id)}")
-    else:
-        lines.append(f"To reverse the action: assume {recovery_who} and detach the deny policy, or use the "
-                      "console link above (identifiers for the CLI form were unavailable this run).")
+    lines.append("NOTE: console links need the account root to have enabled IAM/role access to Billing "
+                 "(off by default); the CLI commands here work either way.")
     lines.append("")
     lines.append(f"Safety configuration: {safety} ({_safety_label(safety)}).")
     lines.append(f"Observed action status (from AWS Budgets, authoritative): {status} at {status_ts} "
                  f"-- {_status_narrative(status)}")
+    lines.append("")
+    # Primary call to action, up top: what to DO now. Status-conditional -- for a
+    # PENDING watch-mode action this is the approve/stop-spend command. The
+    # reverse/undo command is the recovery route at the end of the report.
+    lines.append(_call_to_action(status, account_id, budget_name, action_id))
     lines.append("")
     lines.append("IMPORTANT: Workloads that are already running KEEP running until you stop them yourself.")
     lines.append("This report does not stop anything - it only observes and informs.")
@@ -689,11 +680,19 @@ def build_report(status, status_ts, inv, safety, account_id=None, budget_name=No
     for s in s3_bucket_sizes(deadline_epoch):
         lines.append(f"    - {s}")
     lines.append("")
-    # F4: status-conditional call to action -- never claim "to lift the
-    # block" when nothing is applied (PENDING/REVERSE_SUCCESS/STANDBY), and
-    # always give the PENDING approve path since watch mode has no other
-    # way to apply the deny early besides the (Billing-gated) console.
-    lines.append(_call_to_action(status, account_id, budget_name, action_id))
+    # Recovery route, at the bottom: how to REVERSE/undo the block. F1(c): name the
+    # actual configured recovery principal when known, else point at the README var.
+    recovery_who = recovery_principal_arn or (
+        "the recovery principal configured at deploy time (RECOVERY_PRINCIPAL_ARN; see README)"
+    )
+    if account_id and budget_name and action_id:
+        lines.append(f"To reverse/undo the block: assume {recovery_who} and detach the deny policy, or run:")
+        lines.append("")
+        lines.append(f"    {_reverse_cli(account_id, budget_name, action_id)}")
+        lines.append("")
+    else:
+        lines.append(f"To reverse/undo the block: assume {recovery_who} and detach the deny policy, or use the "
+                      "console link above (identifiers for the CLI form were unavailable this run).")
     if status == "EXECUTION_SUCCESS":
         lines.append("The block also clears automatically at the next budget period if you take no action.")
     return _fit("\n".join(lines))
