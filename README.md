@@ -270,9 +270,11 @@ aws budgets execute-budget-action \
   --execution-type REVERSE_BUDGET_ACTION
 ```
 
-(That's *reverse*, not "reset". Reset is a different, unrelated state.)
+(That's *reverse*, not "reset". See 4.4 before you ever press Reset.)
 Reversing un-blocks launches/starts. It does **not** restart anything,
-because Radar never stopped anything.
+because Radar never stopped anything. A reversed action is **done for the
+month**: AWS stops evaluating it and re-arms it on its own when the next
+budget month starts.
 
 **Where to find the three values** (easiest first):
 
@@ -283,7 +285,34 @@ because Radar never stopped anything.
 3. **CLI:** `aws budgets describe-budget-actions-for-account
    --account-id <ACCOUNT_ID>` lists every action with its ids and status.
 
-## 4.4 Switching between `watch` and `armed`
+## 4.4 Re-arming mid-month (don't just press Reset)
+
+**Reset** (console button, or `--execution-type RESET_BUDGET_ACTION`) puts a
+reversed action back on standby *immediately*. The catch: AWS compares the
+threshold against your **month-to-date** spend, which never goes down within
+the month. If you're already past the threshold, the next budget refresh
+(every 8-12h) sees it crossed and **fires the action again**, even if you
+haven't spent another cent since. Reverse + Reset over and over just loops.
+
+Pick one:
+
+- **Stay unprotected until the 1st (simplest).** Reverse only, never Reset.
+  AWS re-arms the action automatically when the new budget month starts.
+- **Re-arm above what you've already spent.** Raise the threshold past your
+  current spend first, *then* Reset. For example, if you're at 22% of the
+  budget and want about $2 of headroom on a $10 budget, set
+  `ACTION_THRESHOLD_PERCENT=45`, run `npm run deploy`, then Reset. Now it
+  only fires on genuinely new spend. If you're already over 100%, raise
+  `MONTHLY_BUDGET_USD` instead. The preflight will tell you if the new
+  threshold is still at or below your current spend.
+
+**Choosing thresholds up front:** a low automatic threshold (say 20%) is
+easy to cross with incidental charges, and after that it's either tripped
+or disabled for the rest of the month. Keep early warnings on
+`WARN_AT_PERCENT` (email only, never blocks) and put
+`ACTION_THRESHOLD_PERCENT` where you actually want the block, e.g. 80-100%.
+
+## 4.5 Switching between `watch` and `armed`
 
 Edit the one line in `.env`, then redeploy. That *is* the switch:
 
@@ -433,6 +462,11 @@ or use the CLI commands in Part 4, which are never gated.
 3. Check the reporter's **CloudWatch Logs** (Lambda console → the
    `BudgetRadarStack-Reporter…` function → Monitor → Logs) to see whether
    it ran at all.
+
+**The block keeps re-applying after I lift it.** You pressed Reset (or ran
+`RESET_BUDGET_ACTION`) while month-to-date spend was still over the
+threshold, so the next refresh fired it again. Reverse only, or raise the
+threshold above current spend before resetting (4.4).
 
 **`cdk destroy` failed on `DeleteManagedPolicy`.** The block was still
 attached. Use the manual detach commands in Part 5, then re-run destroy.
