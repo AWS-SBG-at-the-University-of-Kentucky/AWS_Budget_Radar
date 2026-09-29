@@ -10,6 +10,11 @@ budget. If your spending crosses it, Budget Radar does two things.
    everything currently running and everything still costing you money, so
    you know exactly what to go turn off.
 
+It also sends a **daily digest** of what's still running, whether or not
+the budget has tripped. Billing data lags up to a day, so this catches the
+notebook you forgot this morning before it ever shows up as spend. Quiet
+days send nothing (see [The daily digest](#the-daily-digest)).
+
 You clone it, fill in one config file, run one deploy command, and let it
 sit. It costs (almost) nothing to run.
 
@@ -43,6 +48,19 @@ your budget crosses the line (AWS checks ~2-3x/day)
  📧 email to you with what's blocked, what's running, and what to do next
 ```
 
+Separately, once a day:
+
+```
+EventBridge schedule (DAILY_DIGEST_HOUR_UTC, default 13:00 UTC)
+        │
+        ▼
+ Radar's digest Lambda (read-only) scans the same regions and services
+        │
+        ▼
+ 📧 digest email, only if something is running/billing, the scan couldn't
+    check anything, or the block is waiting on you (DAILY_DIGEST=findings)
+```
+
 Two modes, set by one line of config:
 
 - **`watch` (default)** makes the block *wait for your approval*. The email
@@ -68,7 +86,7 @@ budget month starts**, or sooner if you reverse it (Part 4).
 | 2.3 | `npx cdk bootstrap` (once per account/region) | "Environment bootstrapped" |
 | 3.1 | `npm run deploy` | "Preflight passed" then `✅ BudgetRadarStack` |
 | 3.2 | Click the SNS confirmation email | `npm run verify` shows no `PendingConfirmation` |
-|  | *Let it sit.* | You get an email if the budget ever trips |
+|  | *Let it sit.* | You get an email if the budget ever trips, and a morning digest on days something is running |
 | 4 | On a trip, approve / lift the block | You know both commands (they're in the email) |
 | 5 | Someday, remove it | Reverse → verify detached → `cdk destroy` |
 
@@ -168,6 +186,11 @@ Less-common fields (all explained in the comments in `.env.example`):
   *checking* your bill (~$0.01 per Cost Explorer request) can't itself trip a tiny
   tripwire — there's no runaway resource to shut down for that spend anyway. Use
   sparingly: every service you exclude is a blind spot.
+- `DAILY_DIGEST` (default `findings`) controls the daily "what's still
+  running" email. `findings` emails only on days something is found,
+  `always` emails every day, `off` turns the daily scan off entirely.
+  `DAILY_DIGEST_HOUR_UTC` (default `13`, i.e. 9am Eastern in summer) sets
+  when it runs. See [The daily digest](#the-daily-digest).
 
 ## 2.3 One-time bootstrap
 
@@ -404,6 +427,41 @@ create/start/invoke actions listed. Anything launched via a
 **service-linked role** runs as a different principal than your user. Any
 identity you didn't list is free. And the root user is never blocked.
 
+## The daily digest
+
+The budget can only react to billing data, which lags real usage by up to
+a day. The digest doesn't wait for billing. Once a day an EventBridge
+schedule runs a second, read-only Lambda that scans the same regions and
+services as the trip report (below) and emails what it finds. Like the
+trip report, it **never stops or changes anything**.
+
+Each digest shows:
+
+- month-to-date spend against your budget, plus AWS's forecast for the month
+- the block's current status, with the approve command if it's waiting on you
+- everything still running or billing, grouped by service and region
+- coverage gaps (regions/services it couldn't check), labeled as such
+
+**When it emails** (`DAILY_DIGEST`):
+
+| Mode | Emails when… |
+|---|---|
+| `findings` (default) | Something is running/billing, **or** no area could be checked at all, **or** the block is `PENDING` approval / `EXECUTION_FAILURE`. Otherwise nothing is sent. |
+| `always` | Every day, including "nothing found". Useful to confirm it's alive. |
+| `off` | Never. No schedule or digest Lambda is deployed. |
+
+A service that's unavailable in one region (a common, harmless scan
+failure) doesn't by itself trigger an email, but it is listed under
+coverage gaps whenever a digest does go out.
+
+**Left out of the digest on purpose:** plain Lambda functions (free while
+idle, and Radar's own functions always exist, so they'd make every digest
+non-empty) and S3 bucket sizes (the CDK bootstrap bucket always exists).
+Lambda *provisioned concurrency*, which does bill while idle, is included.
+The trip report still covers both.
+
+Change the mode or hour in `.env`, then `npm run deploy` again.
+
 ## What the report covers and its gaps
 
 The report **describes. It never acts.** Denied or failed scans are labeled
@@ -426,7 +484,8 @@ Near-zero, but **not guaranteed $0.00**:
 | Item | Cost |
 |---|---|
 | The budget + action | Free (first 2 action-enabled budgets per account) |
-| Lambda + SNS email | Free tier at this volume, Lambda only runs on a trip |
+| Lambda + SNS email | Free tier at this volume. The trip reporter only runs on a trip, the digest once a day (a scan of a minute or so) |
+| EventBridge schedule | Free (scheduled rules have no charge) |
 | CloudWatch Logs | Pennies at most, capped by 30-day retention |
 | CDK bootstrap S3 | A few KB of storage, shared |
 
@@ -462,6 +521,12 @@ or use the CLI commands in Part 4, which are never gated.
 3. Check the reporter's **CloudWatch Logs** (Lambda console → the
    `BudgetRadarStack-Reporter…` function → Monitor → Logs) to see whether
    it ran at all.
+
+**No daily digest.** In `findings` mode (the default) that's normal on a
+day with nothing running. Set `DAILY_DIGEST=always` and redeploy to get one
+every day. Otherwise check the same things as above, but the function is
+`BudgetRadarStack-DigestReporter…`, and its failures land in the same
+`ReporterFailures` queue.
 
 **The block keeps re-applying after I lift it.** You pressed Reset (or ran
 `RESET_BUDGET_ACTION`) while month-to-date spend was still over the

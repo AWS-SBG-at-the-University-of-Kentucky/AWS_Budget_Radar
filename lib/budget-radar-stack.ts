@@ -7,11 +7,28 @@ import * as iam from "aws-cdk-lib/aws-iam";
 import * as sqs from "aws-cdk-lib/aws-sqs";
 import * as logs from "aws-cdk-lib/aws-logs";
 import * as destinations from "aws-cdk-lib/aws-lambda-destinations";
+import * as events from "aws-cdk-lib/aws-events";
+import * as targets from "aws-cdk-lib/aws-events-targets";
 import * as path from "path";
 import { RadarConfig } from "./config";
 import { denyPolicyDocument } from "./deny-policy";
 
 export interface BudgetRadarStackProps extends cdk.StackProps { config: RadarConfig; }
+
+// Read-only inventory calls shared by the trip reporter and the daily digest.
+// Targets are discovered at runtime, so these are granted on resource "*".
+const INVENTORY_READ_ACTIONS: readonly string[] = [
+  "ec2:DescribeRegions", "ec2:DescribeInstances", "ec2:DescribeAddresses",
+  "ec2:DescribeVolumes", "ec2:DescribeNatGateways",
+  "rds:DescribeDBInstances", "rds:DescribeDBClusters",
+  "ecs:ListClusters", "ecs:ListServices", "ecs:DescribeServices",
+  "ecs:ListTasks", "ecs:DescribeTasks",
+  "lambda:ListFunctions", "lambda:GetFunctionConcurrency",
+  "lambda:ListProvisionedConcurrencyConfigs",
+  "sagemaker:ListNotebookInstances", "sagemaker:ListEndpoints",
+  "elasticloadbalancing:DescribeLoadBalancers",
+  "budgets:DescribeBudgetAction"
+];
 
 export class BudgetRadarStack extends cdk.Stack {
   readonly triggerTopic: sns.Topic;
@@ -20,6 +37,9 @@ export class BudgetRadarStack extends cdk.Stack {
   readonly denyPolicy: iam.ManagedPolicy;
   readonly actionRole: iam.Role;
   readonly failureQueue: sqs.Queue;
+  // Present only when DAILY_DIGEST is not "off".
+  readonly digestReporter?: lambda.Function;
+  readonly digestSchedule?: events.Rule;
 
   constructor(scope: Construct, id: string, props: BudgetRadarStackProps) {
     super(scope, id, props);
@@ -79,17 +99,9 @@ export class BudgetRadarStack extends cdk.Stack {
     this.reportTopic.grantPublish(this.reporter);
     this.reporter.addToRolePolicy(new iam.PolicyStatement({
       actions: [
-        "ec2:DescribeRegions", "ec2:DescribeInstances", "ec2:DescribeAddresses",
-        "ec2:DescribeVolumes", "ec2:DescribeNatGateways",
-        "rds:DescribeDBInstances", "rds:DescribeDBClusters",
-        "ecs:ListClusters", "ecs:ListServices", "ecs:DescribeServices",
-        "ecs:ListTasks", "ecs:DescribeTasks",
-        "lambda:ListFunctions", "lambda:GetFunctionConcurrency",
-        "lambda:ListProvisionedConcurrencyConfigs",
-        "sagemaker:ListNotebookInstances", "sagemaker:ListEndpoints",
+        ...INVENTORY_READ_ACTIONS,
+        // S3 sizing (trip report only): bucket list + region, then CloudWatch metrics.
         "cloudwatch:GetMetricData",
-        "elasticloadbalancing:DescribeLoadBalancers",
-        "budgets:DescribeBudgetAction",
         "s3:ListAllMyBuckets", "s3:GetBucketLocation"
       ],
       resources: ["*"]  // targets are discovered at runtime; all actions are read-only
@@ -228,6 +240,60 @@ export class BudgetRadarStack extends cdk.Stack {
     this.reporter.addEnvironment("ACCOUNT_ID", account);
     this.reporter.addEnvironment("BUDGET_NAME", budgetName);
     this.reporter.addEnvironment("ACTION_ID", action.attrActionId);
+
+    // --- Optional daily digest: a scheduled, read-only scan of what is still
+    //     running, emailed whether or not the budget has tripped. Billing data
+    //     lags up to a day, so this surfaces a forgotten resource before it
+    //     shows up as spend. Same code asset as the reporter, separate entry
+    //     point, so the trip path is untouched. ---
+    if (config.dailyDigest !== "off") {
+      // Deterministic rule name so the handler can check the invoking rule's
+      // ARN without an env reference to the rule resource itself (the rule
+      // already references the function, so that would be a cycle).
+      const digestRuleName = `${this.stackName}-daily-digest`;
+      const digestRuleArn = this.formatArn({
+        service: "events", resource: "rule", resourceName: digestRuleName,
+        arnFormat: cdk.ArnFormat.SLASH_RESOURCE_NAME
+      });
+      const digestLogGroup = new logs.LogGroup(this, "DigestLogs", {
+        retention: logs.RetentionDays.ONE_MONTH,
+        removalPolicy: cdk.RemovalPolicy.DESTROY
+      });
+      this.digestReporter = new lambda.Function(this, "DigestReporter", {
+        runtime: lambda.Runtime.PYTHON_3_13,
+        handler: "handler.digest_handler",
+        code: lambda.Code.fromAsset(path.join(__dirname, "..", "lambda")),
+        memorySize: 512,
+        timeout: cdk.Duration.seconds(900),
+        logGroup: digestLogGroup,
+        onFailure: new destinations.SqsDestination(this.failureQueue),
+        environment: {
+          REPORT_TOPIC_ARN: this.reportTopic.topicArn,
+          SAFETY: config.safety,
+          RECOVERY_PRINCIPAL_ARN: config.recoveryPrincipalArn,
+          ACCOUNT_ID: account,
+          BUDGET_NAME: budgetName,
+          ACTION_ID: action.attrActionId,
+          DIGEST_MODE: config.dailyDigest,
+          DIGEST_RULE_ARN: digestRuleArn
+        }
+      });
+      this.reportTopic.grantPublish(this.digestReporter);
+      this.digestReporter.addToRolePolicy(new iam.PolicyStatement({
+        // No S3/CloudWatch: the digest skips bucket sizing. ViewBudget reads
+        // month-to-date and forecasted spend for the header.
+        actions: [...INVENTORY_READ_ACTIONS, "budgets:ViewBudget"],
+        resources: ["*"]  // targets are discovered at runtime; all actions are read-only
+      }));
+      this.digestSchedule = new events.Rule(this, "DailyDigestSchedule", {
+        ruleName: digestRuleName,
+        schedule: events.Schedule.cron({ minute: "0", hour: String(config.dailyDigestHourUtc) }),
+        // A digest delivered hours late is noise; drop it and wait for tomorrow.
+        targets: [new targets.LambdaFunction(this.digestReporter, {
+          retryAttempts: 2, maxEventAge: cdk.Duration.hours(2)
+        })]
+      });
+    }
 
     // --- Optional per-service warn budgets (notification-only, free). ---
     for (const [i, sb] of config.serviceBudgets.entries()) {

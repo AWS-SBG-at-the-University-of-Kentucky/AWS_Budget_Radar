@@ -277,7 +277,11 @@ def _sagemaker_notebooks(region, deadline=None):
     lines = []
     for page in _iter_pages(c.get_paginator("list_notebook_instances"), deadline, lines):
         for nb in page.get("NotebookInstances", []):
-            lines.append(f"{nb['NotebookInstanceName']} {nb.get('InstanceType', '?')} in {region}")
+            # Stopped notebooks still bill for their ML storage volume, so they
+            # stay listed; the status tells the reader which kind it is.
+            status = nb.get("NotebookInstanceStatus")
+            status_note = f" {status}" if status else ""
+            lines.append(f"{nb['NotebookInstanceName']} {nb.get('InstanceType', '?')}{status_note} in {region}")
     return lines
 
 
@@ -353,10 +357,14 @@ def enabled_regions():
     return [r["RegionName"] for r in c.describe_regions()["Regions"]]
 
 
-def inventory(regions, deadline_epoch):
+def inventory(regions, deadline_epoch, adapters=None):
+    """Run each adapter in each region. `adapters` defaults to the full
+    ADAPTERS registry; the daily digest passes a subset."""
+    if adapters is None:
+        adapters = ADAPTERS
     areas = []
     for region in regions:
-        for name, fn in ADAPTERS.items():
+        for name, fn in adapters.items():
             if _past(deadline_epoch):
                 areas.append({"region": region, "service": name, "state": NOT_SCANNED, "items": []})
                 continue
@@ -705,6 +713,34 @@ def publish(topic_arn, subject, body):
     _client("sns").publish(TopicArn=topic_arn, Subject=subject[:100], Message=body)
 
 
+def _scan_deadline(context):
+    """Real deadline derived from the Lambda context's remaining time (falls back
+    to a full 900s budget when no context is supplied, e.g. in tests), minus a
+    margin reserved for report assembly/publish() so the report always ships."""
+    remaining = context.get_remaining_time_in_millis() / 1000 if context is not None else 900
+    return time.time() + max(1, remaining - PUBLISH_MARGIN_SECONDS)
+
+
+def _scan_regions(deadline, adapters=None):
+    """Region discovery plus inventory, shared by the trip report and the daily
+    digest. A region-discovery failure never aborts reporting; it becomes a
+    FAILED area at the top of the inventory instead."""
+    try:
+        regions = enabled_regions()
+        region_failure_area = None
+    except Exception as e:
+        regions = []
+        region_failure_area = {"region": "(all)", "service": "region-enumeration",
+                                "state": FAILED, "items": [], "error": str(e)}
+    if adapters is None:
+        inv = inventory(regions, deadline_epoch=deadline)
+    else:
+        inv = inventory(regions, deadline_epoch=deadline, adapters=adapters)
+    if region_failure_area is not None:
+        inv["areas"].insert(0, region_failure_area)
+    return inv
+
+
 def handler(event, context):
     if not _from_trigger_topic(event):
         print("Event not from TriggerTopic; ignoring.")
@@ -718,25 +754,200 @@ def handler(event, context):
 
     status, status_ts, action_details = observe_action_status(account_id, budget_name, action_id)
 
-    # Real deadline derived from the Lambda context's remaining time (falls back
-    # to a full 900s budget when no context is supplied, e.g. in tests), minus a
-    # margin reserved for build_report()/publish() so the report always ships.
-    remaining = context.get_remaining_time_in_millis() / 1000 if context is not None else 900
-    deadline = time.time() + max(1, remaining - PUBLISH_MARGIN_SECONDS)
-
-    try:
-        regions = enabled_regions()
-        region_failure_area = None
-    except Exception as e:  # never abort reporting just because region discovery failed
-        regions = []
-        region_failure_area = {"region": "(all)", "service": "region-enumeration",
-                                "state": FAILED, "items": [], "error": str(e)}
-    inv = inventory(regions, deadline_epoch=deadline)
-    if region_failure_area is not None:
-        inv["areas"].insert(0, region_failure_area)
+    deadline = _scan_deadline(context)
+    inv = _scan_regions(deadline)
     recovery_principal_arn = os.environ.get("RECOVERY_PRINCIPAL_ARN")
     body = build_report(status, status_ts, inv, safety, account_id=account_id, budget_name=budget_name,
                          action_details=action_details, deadline_epoch=deadline, action_id=action_id,
                          recovery_principal_arn=recovery_principal_arn)
     publish(report_topic, _report_subject(status), body)  # raises on failure
     return {"status": "reported", "action_status": status}
+
+
+# --- Daily digest (scheduled, independent of any budget trip) ---
+#
+# Billing data lags real usage by up to a day, so the budget cannot see
+# something started this morning. The digest is a live scan of what exists
+# right now, run on a daily EventBridge schedule. Read-only, like the trip
+# report: it never stops or changes anything.
+
+# Adapters left out of the digest. Plain Lambda functions cost nothing while
+# idle and always exist (Radar's own functions), so listing them would make
+# every digest non-empty. Provisioned concurrency, which does bill while idle,
+# stays in. S3 sizing is also skipped: the CDK bootstrap bucket always exists.
+DIGEST_SKIPPED_ADAPTERS = frozenset({"lambda-functions"})
+
+# Action states worth an email even on a day with nothing found running: a
+# watch-mode block waiting on approval, or an action AWS says failed.
+DIGEST_ALERT_STATUSES = frozenset({"PENDING", "EXECUTION_FAILURE"})
+
+
+def digest_adapters():
+    return {name: fn for name, fn in ADAPTERS.items() if name not in DIGEST_SKIPPED_ADAPTERS}
+
+
+def _from_digest_schedule(event):
+    """Only the stack's own schedule rule may start a digest. EventBridge
+    scheduled events carry the invoking rule's ARN in `resources`."""
+    want = os.environ.get("DIGEST_RULE_ARN")
+    if not want:
+        return False
+    return (event.get("source") == "aws.events"
+            and event.get("detail-type") == "Scheduled Event"
+            and want in (event.get("resources") or []))
+
+
+def _money(spend):
+    if not spend or spend.get("Amount") is None:
+        return None
+    try:
+        amount = float(spend["Amount"])
+    except (TypeError, ValueError):
+        return None
+    unit = spend.get("Unit") or "USD"
+    return f"${amount:,.2f}" if unit == "USD" else f"{amount:,.2f} {unit}"
+
+
+def budget_spend(account_id, budget_name):
+    """Month-to-date actual and forecasted spend plus the budget limit, as
+    display strings, or None if the lookup failed. Reads the Budgets API (the
+    same figures the budget itself evaluates), not Cost Explorer."""
+    try:
+        budget = _client("budgets").describe_budget(AccountId=account_id, BudgetName=budget_name)["Budget"]
+    except Exception:
+        return None
+    calc = budget.get("CalculatedSpend") or {}
+    return {
+        "actual": _money(calc.get("ActualSpend")),
+        "forecast": _money(calc.get("ForecastedSpend")),
+        "limit": _money(budget.get("BudgetLimit")),
+    }
+
+
+def _format_spend(spend):
+    if not spend or not spend.get("actual"):
+        return "unavailable (budget lookup failed or AWS has not calculated it yet)"
+    text = spend["actual"]
+    if spend.get("limit"):
+        text += f" of {spend['limit']}"
+    if spend.get("forecast"):
+        text += f" (forecast for the month {spend['forecast']})"
+    return text
+
+
+def digest_findings(inv):
+    """Areas that found something still running or still billing."""
+    return [a for a in inv["areas"] if a["items"]]
+
+
+def digest_gaps(inv):
+    """Areas the scan could not fully check."""
+    return [a for a in inv["areas"] if a["state"] in (FAILED, NOT_SCANNED, PARTIAL)]
+
+
+def _scan_blind(inv):
+    """True when no area was checked successfully (every read failed, region
+    discovery failed, or nothing was scanned). An empty result then proves
+    nothing, so the digest must not stay quiet about it."""
+    return not any(a["state"] in (COMPLETE, EMPTY) for a in inv["areas"])
+
+
+def should_send_digest(mode, item_count, status, blind):
+    if mode == "always":
+        return True
+    return item_count > 0 or blind or status in DIGEST_ALERT_STATUSES
+
+
+def _digest_subject(status, item_count):
+    if status == "PENDING":
+        return "AWS Budget Radar daily digest: block awaiting your approval"
+    if status == "EXECUTION_FAILURE":
+        return "AWS Budget Radar daily digest: budget action FAILED"
+    if item_count:
+        return f"AWS Budget Radar daily digest: {item_count} item(s) still running or billing"
+    return "AWS Budget Radar daily digest: nothing found running"
+
+
+def build_digest(status, status_ts, inv, spend, mode, account_id=None, budget_name=None,
+                  action_id=None):
+    findings = digest_findings(inv)
+    gaps = digest_gaps(inv)
+    item_count = sum(len(a["items"]) for a in findings)
+    lines = []
+    lines.append("AWS Budget Radar daily digest.")
+    lines.append("")
+    lines.append(f"AWS account: {account_id or 'unknown'}")
+    lines.append(f"Budget: {budget_name or 'unknown'}")
+    lines.append(f"Month-to-date spend: {_format_spend(spend)}")
+    lines.append(f"Budget action status: {status} at {status_ts} -- {_status_narrative(status)}")
+    if status in ("PENDING", "EXECUTION_SUCCESS"):
+        lines.append("")
+        lines.append(_call_to_action(status, account_id, budget_name, action_id))
+        if status == "EXECUTION_SUCCESS" and account_id and budget_name and action_id:
+            # The call to action points at a reverse command "below"; give it here.
+            lines.append("")
+            lines.append(f"    {_reverse_cli(account_id, budget_name, action_id)}")
+    lines.append("")
+    lines.append("Why this email: AWS billing data lags real usage by up to a day, so the budget cannot see")
+    lines.append("what you started today. This is a live scan of what exists right now, sent whether or not")
+    lines.append("the budget has tripped.")
+    lines.append("")
+    lines.append(f"Scan generated: {inv.get('generated', status_ts)}")
+    lines.append("")
+    if findings:
+        lines.append(f"Still running or still billing ({item_count} item(s)):")
+        for area in findings:
+            lines.append(f"[{area['state'].upper()}] {area['service']} @ {area['region']}")
+            for it in area["items"]:
+                lines.append(f"    - {it}")
+    else:
+        lines.append("Nothing found running or billing in the areas that were checked.")
+    if gaps:
+        lines.append("")
+        lines.append(f"Coverage gaps ({len(gaps)} area(s) not fully checked, so an empty result there is not proof of zero):")
+        for area in gaps:
+            detail = area.get("error") or area.get("reason") or ""
+            suffix = f" - {detail}" if detail else ""
+            lines.append(f"    - [{area['state'].upper()}] {area['service']} @ {area['region']}{suffix}")
+    lines.append("")
+    lines.append("Not in this digest: Lambda functions without provisioned concurrency (free while idle),")
+    lines.append("S3 bucket sizes, and the known gaps listed in the README (EKS, OpenSearch, ElastiCache,")
+    lines.append("Savings Plans/RI commitments, data transfer).")
+    lines.append("Nothing was stopped or changed. Budget Radar only reports.")
+    lines.append("")
+    if mode == "always":
+        lines.append("You get this digest every day (DAILY_DIGEST=always).")
+    else:
+        lines.append("You get this digest only on days something is found, the scan could not check anything,")
+        lines.append("or the budget action needs you (DAILY_DIGEST=findings).")
+    lines.append("To stop it, set DAILY_DIGEST=off in .env and run npm run deploy again.")
+    return _fit("\n".join(lines))
+
+
+def digest_handler(event, context):
+    if not _from_digest_schedule(event):
+        print("Event not from the daily digest schedule; ignoring.")
+        return {"status": "ignored"}
+
+    account_id = os.environ["ACCOUNT_ID"]
+    budget_name = os.environ["BUDGET_NAME"]
+    action_id = os.environ["ACTION_ID"]
+    report_topic = os.environ["REPORT_TOPIC_ARN"]
+    mode = os.environ.get("DIGEST_MODE", "findings")
+
+    status, status_ts, _ = observe_action_status(account_id, budget_name, action_id)
+    spend = budget_spend(account_id, budget_name)
+    inv = _scan_regions(_scan_deadline(context), adapters=digest_adapters())
+
+    item_count = sum(len(a["items"]) for a in digest_findings(inv))
+    blind = _scan_blind(inv)
+    print(f"Digest scan: {item_count} item(s) found, {len(digest_gaps(inv))} coverage gap(s), "
+          f"action status {status}, scan blind={blind}.")
+    if not should_send_digest(mode, item_count, status, blind):
+        print("Nothing to report today (DAILY_DIGEST=findings); no email sent.")
+        return {"status": "quiet", "items": 0, "action_status": status}
+
+    body = build_digest(status, status_ts, inv, spend, mode, account_id=account_id,
+                         budget_name=budget_name, action_id=action_id)
+    publish(report_topic, _digest_subject(status, item_count), body)  # raises on failure
+    return {"status": "reported", "items": item_count, "action_status": status}

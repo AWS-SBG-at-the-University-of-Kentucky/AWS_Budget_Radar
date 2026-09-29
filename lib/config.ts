@@ -1,5 +1,9 @@
 export type Safety = "watch" | "armed";
 export type ThresholdType = "ACTUAL" | "FORECASTED";
+// Daily "what's still running" digest. findings = email only on days the
+// scan finds something still billing; always = email every day; off = no
+// scheduled scan at all.
+export type DigestMode = "findings" | "always" | "off";
 export interface ServiceBudget { service: string; limitUsd: number; }
 export interface RadarConfig {
   alertEmail: string;
@@ -28,6 +32,11 @@ export interface RadarConfig {
   // gross-usage is preserved via a RECORD_TYPE credit/refund exclusion +
   // UnblendedCost metric in the stack).
   excludeServices: string[];
+  // Scheduled daily inventory email, independent of the budget tripping.
+  // Billing data lags up to a day, so this catches a forgotten resource on a
+  // live scan before it ever shows up as spend.
+  dailyDigest: DigestMode;
+  dailyDigestHourUtc: number;
 }
 
 function list(v?: string): string[] {
@@ -128,11 +137,20 @@ export function loadConfig(env: NodeJS.ProcessEnv): RadarConfig {
     return { service, limitUsd };
   });
 
+  const dailyDigest = ((env.DAILY_DIGEST ?? "").trim() || "findings") as DigestMode;
+  if (dailyDigest !== "findings" && dailyDigest !== "always" && dailyDigest !== "off") {
+    throw new Error('DAILY_DIGEST must be "findings", "always", or "off".');
+  }
+  const dailyDigestHourUtc = num("DAILY_DIGEST_HOUR_UTC", (env.DAILY_DIGEST_HOUR_UTC ?? "").trim() || "13", 0, 23);
+  if (!Number.isInteger(dailyDigestHourUtc)) {
+    throw new Error(`DAILY_DIGEST_HOUR_UTC must be a whole hour in [0, 23]. Got: ${env.DAILY_DIGEST_HOUR_UTC}`);
+  }
+
   return {
     alertEmail: email, existingBudgetName, monthlyBudgetUsd, warnAtPercent,
     actionThresholdPercent, actionThresholdType: thresholdType, safety,
     denyTargetUsers: users, denyTargetGroups: groups, denyTargetRoles: roles,
     recoveryPrincipalArn: recovery, serviceBudgets, trackGrossUsage,
-    excludeServices: list(env.EXCLUDE_SERVICES)
+    excludeServices: list(env.EXCLUDE_SERVICES), dailyDigest, dailyDigestHourUtc
   };
 }

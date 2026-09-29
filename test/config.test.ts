@@ -124,3 +124,34 @@ test("parses SERVICE_BUDGETS list", () => {
     { service: "Amazon SageMaker", limitUsd: 10 }
   ]);
 });
+
+// --- Daily digest ---
+
+test("daily digest defaults to findings mode at 13:00 UTC", () => {
+  const c = loadConfig({ ...base } as any);
+  expect(c.dailyDigest).toBe("findings");
+  expect(c.dailyDigestHourUtc).toBe(13);
+});
+
+test("empty DAILY_DIGEST / DAILY_DIGEST_HOUR_UTC fall back to the defaults", () => {
+  const c = loadConfig({ ...base, DAILY_DIGEST: " ", DAILY_DIGEST_HOUR_UTC: "" } as any);
+  expect(c.dailyDigest).toBe("findings");
+  expect(c.dailyDigestHourUtc).toBe(13);
+});
+
+test.each(["findings", "always", "off"])("accepts DAILY_DIGEST=%s", mode => {
+  expect(loadConfig({ ...base, DAILY_DIGEST: mode } as any).dailyDigest).toBe(mode);
+});
+
+test("rejects an unknown DAILY_DIGEST mode", () => {
+  expect(() => loadConfig({ ...base, DAILY_DIGEST: "weekly" } as any)).toThrow(/DAILY_DIGEST/);
+});
+
+test("accepts DAILY_DIGEST_HOUR_UTC at both ends of the day", () => {
+  expect(loadConfig({ ...base, DAILY_DIGEST_HOUR_UTC: "0" } as any).dailyDigestHourUtc).toBe(0);
+  expect(loadConfig({ ...base, DAILY_DIGEST_HOUR_UTC: "23" } as any).dailyDigestHourUtc).toBe(23);
+});
+
+test.each(["24", "-1", "9.5", "nine"])("rejects DAILY_DIGEST_HOUR_UTC=%s", hour => {
+  expect(() => loadConfig({ ...base, DAILY_DIGEST_HOUR_UTC: hour } as any)).toThrow(/DAILY_DIGEST_HOUR_UTC/);
+});

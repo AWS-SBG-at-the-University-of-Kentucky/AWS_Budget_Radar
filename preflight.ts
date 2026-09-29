@@ -316,6 +316,17 @@ export async function runPreflight(config: RadarConfig, deps: PreflightDeps): Pr
     "Deploy summary: expect a near-zero, but not exactly $0.00, baseline even at rest (minor storage/request " +
     "charges are normal) — a literal $0.00 bill is not guaranteed and its absence does not indicate a problem."
   );
+  if (config.dailyDigest === "off") {
+    info("Deploy summary: daily digest is OFF (DAILY_DIGEST=off). You will only hear from Radar when the budget trips.");
+  } else {
+    const when = config.dailyDigest === "always"
+      ? "every day"
+      : "only on days it finds something still running/billing, cannot check anything, or the block needs you";
+    info(
+      `Deploy summary: daily digest (DAILY_DIGEST=${config.dailyDigest}) scans what is running at ` +
+      `${String(config.dailyDigestHourUtc).padStart(2, "0")}:00 UTC and emails ${when}.`
+    );
+  }
 
   // Augmentation 3: reject wildcard / cross-account target forms at preflight
   // too (defense in depth beyond lib/config.ts's own checks).

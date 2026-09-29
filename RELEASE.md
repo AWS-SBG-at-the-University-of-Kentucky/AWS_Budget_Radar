@@ -218,6 +218,20 @@ confirm, not just unit coverage.
    confirm the preflight rejects it (the "scoped budgets are rejected in
    v1" check) before any AWS mutation, matching the existing unit coverage
    for this rejection.
+9. **Daily digest.** Deploy with `DAILY_DIGEST=always` and a
+   `DAILY_DIGEST_HOUR_UTC` a little ahead of now, and confirm: (a) the
+   scheduled run invokes `DigestReporter` and the digest email arrives with
+   month-to-date spend populated (not "unavailable"); (b) a direct
+   `aws lambda invoke` of `DigestReporter` with a hand-made payload returns
+   `{"status": "ignored"}` (only the stack's own rule ARN is accepted);
+   (c) launch one small EC2 instance, redeploy with `DAILY_DIGEST=findings`,
+   and confirm the next run emails it, then terminate it and confirm the
+   following run logs "no email sent" and sends nothing; (d) under a
+   `PENDING` watch-mode action, the digest subject reads "block awaiting
+   your approval" and the body carries the approve command; (e) record the
+   scan's wall-clock duration from the function's logs across all enabled
+   regions; (f) `DAILY_DIGEST=off` removes the function and rule on
+   redeploy.
 
 ---
 

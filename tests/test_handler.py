@@ -1284,3 +1284,265 @@ def test_execution_success_report_does_say_how_to_lift_the_block():
     )
     assert "the block is applied" in body.lower()
     assert handler._reverse_cli("111122223333", "my-budget", "aaaa-bbbb") in body
+
+
+# --- Daily digest ---
+
+DIGEST_RULE_ARN = "arn:aws:events:us-east-1:111122223333:rule/BudgetRadarStack-daily-digest"
+
+
+def _digest_event(rule_arn=DIGEST_RULE_ARN):
+    return {"source": "aws.events", "detail-type": "Scheduled Event", "resources": [rule_arn], "detail": {}}
+
+
+def _digest_env(monkeypatch, mode="findings"):
+    monkeypatch.setenv("DIGEST_RULE_ARN", DIGEST_RULE_ARN)
+    monkeypatch.setenv("ACCOUNT_ID", "111122223333")
+    monkeypatch.setenv("BUDGET_NAME", "b")
+    monkeypatch.setenv("ACTION_ID", "11111111-1111-1111-1111-111111111111")
+    monkeypatch.setenv("REPORT_TOPIC_ARN", "arn:aws:sns:us-east-1:111122223333:Report")
+    monkeypatch.setenv("DIGEST_MODE", mode)
+
+
+def _run_digest(monkeypatch, areas, status="STANDBY", mode="findings", spend=None):
+    """Drive digest_handler with a fixed inventory; returns (result, published)."""
+    _digest_env(monkeypatch, mode)
+    published = []
+    seen = {}
+
+    def fake_scan(deadline, adapters=None):
+        seen["adapters"] = adapters
+        return {"areas": areas, "generated": "2026-09-29T13:00:00+00:00"}
+
+    monkeypatch.setattr(handler, "_scan_regions", fake_scan)
+    monkeypatch.setattr(handler, "observe_action_status",
+                        lambda a, b, c: (status, "2026-09-29T13:00:00+00:00", None))
+    monkeypatch.setattr(handler, "budget_spend", lambda a, b: spend)
+    monkeypatch.setattr(handler, "publish",
+                        lambda topic, subject, body: published.append((topic, subject, body)))
+    result = handler.digest_handler(_digest_event(), None)
+    return result, published, seen
+
+
+_EC2_AREA = {"region": "us-east-1", "service": "ec2-instances", "state": "complete",
+             "items": ["i-1 t3.micro in us-east-1"]}
+_EMPTY_AREA = {"region": "us-east-1", "service": "rds-instances", "state": "empty", "items": []}
+
+
+def test_digest_ignores_events_not_from_its_schedule_rule(monkeypatch):
+    _digest_env(monkeypatch)
+    monkeypatch.setattr(handler, "_scan_regions",
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("should not scan")))
+    other_rule = "arn:aws:events:us-east-1:111122223333:rule/someone-elses-rule"
+    assert handler.digest_handler(_digest_event(other_rule), None)["status"] == "ignored"
+    # An SNS trip event is not a digest event either.
+    sns_event = {"Records": [{"Sns": {"TopicArn": "arn:aws:sns:us-east-1:111122223333:Trigger"}}]}
+    assert handler.digest_handler(sns_event, None)["status"] == "ignored"
+
+
+def test_digest_ignores_everything_when_rule_arn_unset(monkeypatch):
+    monkeypatch.delenv("DIGEST_RULE_ARN", raising=False)
+    assert handler._from_digest_schedule(_digest_event()) is False
+
+
+def test_trip_handler_ignores_digest_events(monkeypatch):
+    monkeypatch.setenv("TRIGGER_TOPIC_ARN", "arn:aws:sns:us-east-1:111122223333:Trigger")
+    assert handler.handler(_digest_event(), None)["status"] == "ignored"
+
+
+def test_digest_scans_without_plain_lambda_functions():
+    names = set(handler.digest_adapters())
+    assert "lambda-functions" not in names
+    assert "lambda-provisioned-concurrency" in names
+    assert names == set(handler.ADAPTERS) - {"lambda-functions"}
+
+
+def test_digest_passes_its_adapter_subset_to_the_scan(monkeypatch):
+    _, _, seen = _run_digest(monkeypatch, [_EC2_AREA])
+    assert set(seen["adapters"]) == set(handler.digest_adapters())
+
+
+def test_digest_findings_mode_sends_when_something_is_running(monkeypatch):
+    result, published, _ = _run_digest(monkeypatch, [_EC2_AREA, _EMPTY_AREA])
+    assert result == {"status": "reported", "items": 1, "action_status": "STANDBY"}
+    topic, subject, body = published[0]
+    assert topic.endswith(":Report")
+    assert subject == "AWS Budget Radar daily digest: 1 item(s) still running or billing"
+    assert "i-1 t3.micro in us-east-1" in body
+    assert "ec2-instances @ us-east-1" in body
+    assert "rds-instances" not in body  # empty areas are not listed
+
+
+def test_digest_findings_mode_stays_quiet_on_a_clean_day(monkeypatch):
+    result, published, _ = _run_digest(monkeypatch, [_EMPTY_AREA])
+    assert result["status"] == "quiet"
+    assert published == []
+
+
+def test_digest_always_mode_sends_on_a_clean_day(monkeypatch):
+    result, published, _ = _run_digest(monkeypatch, [_EMPTY_AREA], mode="always")
+    assert result["status"] == "reported"
+    subject, body = published[0][1], published[0][2]
+    assert subject == "AWS Budget Radar daily digest: nothing found running"
+    assert "Nothing found running or billing" in body
+    assert "DAILY_DIGEST=always" in body
+
+
+def test_digest_sends_when_block_awaits_approval_even_with_no_findings(monkeypatch):
+    result, published, _ = _run_digest(monkeypatch, [_EMPTY_AREA], status="PENDING")
+    assert result["status"] == "reported"
+    subject, body = published[0][1], published[0][2]
+    assert "awaiting your approval" in subject
+    assert "aws budgets execute-budget-action" in body
+    assert "APPROVE_BUDGET_ACTION" in body
+
+
+def test_digest_sends_when_budget_action_failed(monkeypatch):
+    result, published, _ = _run_digest(monkeypatch, [_EMPTY_AREA], status="EXECUTION_FAILURE")
+    assert result["status"] == "reported"
+    assert "FAILED" in published[0][1]
+
+
+def test_digest_sends_when_the_scan_checked_nothing(monkeypatch):
+    """Every read failed: an empty result proves nothing, so don't stay quiet."""
+    failed = {"region": "us-east-1", "service": "ec2-instances", "state": "failed",
+              "items": [], "error": "AccessDenied"}
+    result, published, _ = _run_digest(monkeypatch, [failed])
+    assert result["status"] == "reported"
+    body = published[0][2]
+    assert "Coverage gaps (1 area(s)" in body
+    assert "[FAILED] ec2-instances @ us-east-1 - AccessDenied" in body
+
+
+def test_digest_stays_quiet_when_some_areas_failed_but_others_were_checked(monkeypatch):
+    """A service unavailable in one region shouldn't produce an email every day."""
+    failed = {"region": "ap-east-2", "service": "sagemaker-notebooks", "state": "failed",
+              "items": [], "error": "EndpointConnectionError"}
+    result, published, _ = _run_digest(monkeypatch, [_EMPTY_AREA, failed])
+    assert result["status"] == "quiet"
+    assert published == []
+
+
+def test_digest_lists_gaps_alongside_findings(monkeypatch):
+    not_scanned = {"region": "eu-west-1", "service": "ebs-volumes", "state": "not_scanned", "items": []}
+    _, published, _ = _run_digest(monkeypatch, [_EC2_AREA, not_scanned])
+    assert "[NOT_SCANNED] ebs-volumes @ eu-west-1" in published[0][2]
+
+
+def test_digest_shows_month_to_date_spend(monkeypatch):
+    spend = {"actual": "$1.23", "forecast": "$3.10", "limit": "$5.00"}
+    _, published, _ = _run_digest(monkeypatch, [_EC2_AREA], spend=spend)
+    assert "Month-to-date spend: $1.23 of $5.00 (forecast for the month $3.10)" in published[0][2]
+
+
+def test_digest_says_spend_unavailable_when_lookup_failed(monkeypatch):
+    _, published, _ = _run_digest(monkeypatch, [_EC2_AREA], spend=None)
+    assert "Month-to-date spend: unavailable" in published[0][2]
+
+
+def test_digest_publish_failure_raises(monkeypatch):
+    _digest_env(monkeypatch)
+    monkeypatch.setattr(handler, "_scan_regions",
+                        lambda deadline, adapters=None: {"areas": [_EC2_AREA], "generated": "x"})
+    monkeypatch.setattr(handler, "observe_action_status", lambda a, b, c: ("STANDBY", "t", None))
+    monkeypatch.setattr(handler, "budget_spend", lambda a, b: None)
+
+    def boom(topic, subject, body):
+        raise RuntimeError("sns down")
+
+    monkeypatch.setattr(handler, "publish", boom)
+    try:
+        handler.digest_handler(_digest_event(), None)
+    except RuntimeError as e:
+        assert "sns down" in str(e)
+    else:
+        raise AssertionError("publish failure must propagate so the async retry/DLQ path fires")
+
+
+def test_digest_subjects_are_ascii_and_within_sns_limit():
+    for status, count in [("PENDING", 0), ("EXECUTION_FAILURE", 0), ("STANDBY", 12345), ("STANDBY", 0)]:
+        subject = handler._digest_subject(status, count)
+        assert subject.isascii()
+        assert len(subject) <= 100
+
+
+def test_budget_spend_reads_describe_budget(monkeypatch):
+    client = boto3.client("budgets", region_name="us-east-1")
+    stub = Stubber(client)
+    stub.add_response("describe_budget", {"Budget": {
+        "BudgetName": "b", "TimeUnit": "MONTHLY", "BudgetType": "COST",
+        "BudgetLimit": {"Amount": "5.0", "Unit": "USD"},
+        "CalculatedSpend": {"ActualSpend": {"Amount": "1.234", "Unit": "USD"},
+                            "ForecastedSpend": {"Amount": "3.1", "Unit": "USD"}}}},
+        {"AccountId": "111122223333", "BudgetName": "b"})
+    stub.activate()
+    monkeypatch.setattr(handler, "_client", lambda svc, region=None: client)
+    assert handler.budget_spend("111122223333", "b") == {
+        "actual": "$1.23", "forecast": "$3.10", "limit": "$5.00"}
+
+
+def test_budget_spend_returns_none_on_failure(monkeypatch):
+    def boom(svc, region=None):
+        raise RuntimeError("AccessDenied")
+    monkeypatch.setattr(handler, "_client", boom)
+    assert handler.budget_spend("111122223333", "b") is None
+
+
+def test_budget_spend_tolerates_missing_forecast(monkeypatch):
+    client = boto3.client("budgets", region_name="us-east-1")
+    stub = Stubber(client)
+    stub.add_response("describe_budget", {"Budget": {
+        "BudgetName": "b", "TimeUnit": "MONTHLY", "BudgetType": "COST",
+        "BudgetLimit": {"Amount": "5", "Unit": "USD"},
+        "CalculatedSpend": {"ActualSpend": {"Amount": "0", "Unit": "USD"}}}},
+        {"AccountId": "111122223333", "BudgetName": "b"})
+    stub.activate()
+    monkeypatch.setattr(handler, "_client", lambda svc, region=None: client)
+    spend = handler.budget_spend("111122223333", "b")
+    assert spend == {"actual": "$0.00", "forecast": None, "limit": "$5.00"}
+    assert handler._format_spend(spend) == "$0.00 of $5.00"
+
+
+def test_inventory_honors_an_explicit_adapter_subset(monkeypatch):
+    monkeypatch.setattr(handler, "ADAPTERS", {
+        "svc-a": lambda r, deadline=None: ["a"],
+        "svc-b": lambda r, deadline=None: (_ for _ in ()).throw(AssertionError("not in subset")),
+    })
+    result = handler.inventory(["us-east-1"], deadline_epoch=time.time() + 60,
+                               adapters={"svc-a": handler.ADAPTERS["svc-a"]})
+    assert [a["service"] for a in result["areas"]] == ["svc-a"]
+
+
+def test_scan_regions_turns_region_discovery_failure_into_a_failed_area(monkeypatch):
+    def boom():
+        raise RuntimeError("DescribeRegions denied")
+    monkeypatch.setattr(handler, "enabled_regions", boom)
+    inv = handler._scan_regions(time.time() + 60, adapters={})
+    assert inv["areas"][0]["service"] == "region-enumeration"
+    assert inv["areas"][0]["state"] == "failed"
+    assert handler._scan_blind(inv) is True
+
+
+def test_sagemaker_notebook_line_includes_status_when_present(monkeypatch):
+    client = boto3.client("sagemaker", region_name="us-east-1")
+    stub = Stubber(client)
+    stub.add_response("list_notebook_instances", {"NotebookInstances": [{
+        "NotebookInstanceName": "nb1",
+        "NotebookInstanceArn": "arn:aws:sagemaker:us-east-1:111122223333:notebook-instance/nb1",
+        "InstanceType": "ml.t3.medium", "NotebookInstanceStatus": "Stopped"}]}, {})
+    stub.activate()
+    monkeypatch.setattr(handler, "_client", lambda svc, region=None: client)
+    assert handler._sagemaker_notebooks("us-east-1") == ["nb1 ml.t3.medium Stopped in us-east-1"]
+
+
+def test_digest_with_block_applied_includes_the_reverse_command(monkeypatch):
+    _, published, _ = _run_digest(monkeypatch, [_EC2_AREA], status="EXECUTION_SUCCESS")
+    body = published[0][2]
+    assert "The block is applied" in body
+    assert "REVERSE_BUDGET_ACTION" in body
+
+
+def test_digest_without_a_block_shows_no_approve_or_reverse_command(monkeypatch):
+    _, published, _ = _run_digest(monkeypatch, [_EC2_AREA], status="STANDBY")
+    body = published[0][2]
+    assert "execute-budget-action" not in body

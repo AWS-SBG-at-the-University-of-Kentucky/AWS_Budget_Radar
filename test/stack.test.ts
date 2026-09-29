@@ -8,13 +8,20 @@ const cfg: RadarConfig = {
   warnAtPercent: 80, actionThresholdPercent: 100, actionThresholdType: "ACTUAL",
   safety: "watch", denyTargetUsers: ["student"], denyTargetGroups: [], denyTargetRoles: [],
   recoveryPrincipalArn: "arn:aws:iam::111122223333:role/Admin", serviceBudgets: [],
-  trackGrossUsage: true, excludeServices: []
+  trackGrossUsage: true, excludeServices: [], dailyDigest: "findings", dailyDigestHourUtc: 13
 };
 
 function synth(config: RadarConfig): Template {
   const app = new cdk.App();
   const stack = new BudgetRadarStack(app, "TestStack", { config, env: { account: "111122223333", region: "us-east-1" } });
   return Template.fromStack(stack);
+}
+
+// The trip reporter is the function whose handler is handler.handler (the
+// daily digest is a second function from the same asset).
+function reporterProps(t: Template): any {
+  return Object.values(t.findResources("AWS::Lambda::Function"))
+    .find(r => r.Properties.Handler === "handler.handler")!.Properties;
 }
 
 function synthStack(config: RadarConfig): { stack: BudgetRadarStack; template: Template } {
@@ -217,7 +224,7 @@ test("action targets the configured identities and publishes to the trigger topi
 
 test("reporter receives account/budget/action env identifiers", () => {
   const t = synth(cfg);
-  const fn = Object.values(t.findResources("AWS::Lambda::Function"))[0].Properties;
+  const fn = reporterProps(t);
   expect(fn.Environment.Variables).toEqual(expect.objectContaining({
     ACCOUNT_ID: expect.anything(),
     BUDGET_NAME: expect.anything(),
@@ -229,7 +236,7 @@ test("reporter receives account/budget/action env identifiers", () => {
 
 test("reporter receives RECOVERY_PRINCIPAL_ARN as an env var", () => {
   const t = synth(cfg);
-  const fn = Object.values(t.findResources("AWS::Lambda::Function"))[0].Properties;
+  const fn = reporterProps(t);
   expect(fn.Environment.Variables).toEqual(expect.objectContaining({
     RECOVERY_PRINCIPAL_ARN: cfg.recoveryPrincipalArn
   }));
@@ -305,4 +312,101 @@ test("Path B: explicit CFN DependsOn wires action -> budget/role policy/trigger 
 test("a cross-account full-ARN deny target throws at synth", () => {
   const badCfg: RadarConfig = { ...cfg, denyTargetRoles: ["arn:aws:iam::999999999999:role/Other"] };
   expect(() => synth(badCfg)).toThrow(/different account/);
+});
+
+// --- Daily digest ---
+
+function digestProps(t: Template): any {
+  return Object.values(t.findResources("AWS::Lambda::Function"))
+    .find(r => r.Properties.Handler === "handler.digest_handler")?.Properties;
+}
+
+test("daily digest: a second function on its own entry point, scheduled daily at the configured UTC hour", () => {
+  const t = synth({ ...cfg, dailyDigestHourUtc: 7 });
+  t.resourceCountIs("AWS::Lambda::Function", 2);
+  const fn = digestProps(t);
+  expect(fn).toBeDefined();
+  expect(fn.Runtime).toBe("python3.13");
+  expect(fn.Timeout).toBe(900);
+  t.resourceCountIs("AWS::Events::Rule", 1);
+  t.hasResourceProperties("AWS::Events::Rule", Match.objectLike({
+    Name: "TestStack-daily-digest",
+    ScheduleExpression: "cron(0 7 * * ? *)",
+    State: "ENABLED"
+  }));
+});
+
+test("daily digest: the schedule targets the digest function (not the trip reporter)", () => {
+  const { stack, template } = synthStack(cfg);
+  const digestId = stack.getLogicalId(stack.digestReporter!.node.defaultChild as cdk.CfnElement);
+  const rule = Object.values(template.findResources("AWS::Events::Rule"))[0].Properties;
+  expect(rule.Targets).toHaveLength(1);
+  expect(rule.Targets[0].Arn).toEqual({ "Fn::GetAtt": [digestId, "Arn"] });
+  expect(rule.Targets[0].RetryPolicy).toEqual(expect.objectContaining({
+    MaximumRetryAttempts: 2, MaximumEventAgeInSeconds: 7200
+  }));
+  template.hasResourceProperties("AWS::Lambda::Permission", Match.objectLike({
+    Principal: "events.amazonaws.com",
+    FunctionName: { "Fn::GetAtt": [digestId, "Arn"] }
+  }));
+});
+
+test("daily digest: env carries the mode, the rule ARN it checks, and the budget/action identifiers", () => {
+  const fn = digestProps(synth({ ...cfg, dailyDigest: "always" }));
+  expect(fn.Environment.Variables).toEqual(expect.objectContaining({
+    DIGEST_MODE: "always",
+    DIGEST_RULE_ARN: {
+      "Fn::Join": ["", ["arn:", { Ref: "AWS::Partition" }, ":events:us-east-1:111122223333:rule/TestStack-daily-digest"]]
+    },
+    ACCOUNT_ID: "111122223333",
+    BUDGET_NAME: expect.anything(),
+    ACTION_ID: expect.anything(),
+    REPORT_TOPIC_ARN: expect.anything()
+  }));
+  // Only the trip reporter listens on the trigger topic.
+  expect(fn.Environment.Variables.TRIGGER_TOPIC_ARN).toBeUndefined();
+});
+
+test("daily digest: shares the failure queue and gets its own bounded log group", () => {
+  const t = synth(cfg);
+  t.resourceCountIs("AWS::SQS::Queue", 1);
+  const invokeConfigs = Object.values(t.findResources("AWS::Lambda::EventInvokeConfig"));
+  expect(invokeConfigs).toHaveLength(2);
+  for (const c of invokeConfigs) {
+    expect(c.Properties.DestinationConfig.OnFailure).toBeDefined();
+  }
+  const logGroups = Object.values(t.findResources("AWS::Logs::LogGroup"));
+  expect(logGroups).toHaveLength(2);
+  for (const lg of logGroups) expect(lg.Properties.RetentionInDays).toBe(30);
+});
+
+test("daily digest: role is read-only, can read budget spend, and skips S3/CloudWatch", () => {
+  const { stack, template } = synthStack(cfg);
+  const roleId = stack.getLogicalId(stack.digestReporter!.role!.node.defaultChild as cdk.CfnElement);
+  const policies = Object.values(template.findResources("AWS::IAM::Policy"))
+    .filter(p => (p.Properties.Roles as any[]).some(r => r.Ref === roleId));
+  const actions = policies.flatMap(p => p.Properties.PolicyDocument.Statement)
+    .flatMap((s: any) => (Array.isArray(s.Action) ? s.Action : [s.Action]));
+  expect(actions).toEqual(expect.arrayContaining([
+    "budgets:ViewBudget", "budgets:DescribeBudgetAction", "ec2:DescribeInstances", "sns:Publish"
+  ]));
+  const writeLike = actions.filter((a: string) =>
+    a !== "sns:Publish" && a !== "sqs:SendMessage" &&
+    !/^[a-z0-9-]+:(Describe|List|Get|View)/.test(a));
+  expect(writeLike).toEqual([]);
+  expect(actions.some((a: string) => a.startsWith("s3:") || a.startsWith("cloudwatch:"))).toBe(false);
+});
+
+test("DAILY_DIGEST=off creates no digest function, rule, or extra log group", () => {
+  const { stack, template } = synthStack({ ...cfg, dailyDigest: "off" });
+  expect(stack.digestReporter).toBeUndefined();
+  expect(stack.digestSchedule).toBeUndefined();
+  template.resourceCountIs("AWS::Lambda::Function", 1);
+  template.resourceCountIs("AWS::Events::Rule", 0);
+  template.resourceCountIs("AWS::Logs::LogGroup", 1);
+});
+
+test("daily digest works on Path A (existing budget) too", () => {
+  const fn = digestProps(synth({ ...cfg, existingBudgetName: "MyBudget" }));
+  expect(fn.Environment.Variables.BUDGET_NAME).toBe("MyBudget");
 });

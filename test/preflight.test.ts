@@ -17,6 +17,8 @@ function cfg(overrides: Partial<RadarConfig> = {}): RadarConfig {
     serviceBudgets: [],
     trackGrossUsage: true,
     excludeServices: [],
+    dailyDigest: "findings",
+    dailyDigestHourUtc: 13,
     ...overrides
   };
 }
