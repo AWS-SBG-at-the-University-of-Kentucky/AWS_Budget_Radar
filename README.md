@@ -19,8 +19,10 @@ sit. It costs (almost) nothing to run.
 > charges can pass the threshold before the alert fires and keep accruing
 > after.
 >
-> **It never turns anything off.** Things already running keep running until
-> *you* stop them. The email tells you what and where.
+> **It only turns off what you list.** Things already running keep running
+> until *you* stop them, unless you opt in to stopping specific EC2/RDS
+> instances ([4.6](#46-optional-stop-specific-instances-too)). The email tells
+> you what else is running and where.
 >
 > **It only restrains the identities you list.** The root user and anything
 > you didn't list are unaffected. It's a seatbelt, not a security boundary.
@@ -42,6 +44,10 @@ your budget crosses the line (AWS checks ~2-3x/day)
         ▼
  📧 email to you with what's blocked, what's running, and what to do next
 ```
+
+Optionally, the same threshold can also **stop specific EC2/RDS instances**
+you list in `.env`. AWS Budgets does that itself by running AWS's own stop
+runbooks, so they're stopped, never terminated (see 4.6).
 
 Two modes, set by one line of config:
 
@@ -168,6 +174,10 @@ Less-common fields (all explained in the comments in `.env.example`):
   *checking* your bill (~$0.01 per Cost Explorer request) can't itself trip a tiny
   tripwire — there's no runaway resource to shut down for that spend anyway. Use
   sparingly: every service you exclude is a blind spot.
+- `STOP_EC2_INSTANCES` / `STOP_RDS_INSTANCES` (default **empty**) list
+  long-lived instances that AWS should **stop** at the same threshold as the
+  block. Empty means nothing is ever stopped. See
+  [4.6](#46-optional-stop-specific-instances-too).
 
 ## 2.3 One-time bootstrap
 
@@ -271,8 +281,9 @@ aws budgets execute-budget-action \
 ```
 
 (That's *reverse*, not "reset". See 4.4 before you ever press Reset.)
-Reversing un-blocks launches/starts. It does **not** restart anything,
-because Radar never stopped anything. A reversed action is **done for the
+Reversing un-blocks launches/starts. It does **not** restart anything. If
+you configured stop actions (4.6), those instances stay stopped until you
+start them. A reversed action is **done for the
 month**: AWS stops evaluating it and re-arms it on its own when the next
 budget month starts.
 
@@ -331,6 +342,62 @@ threshold (that would be lockout-by-deploy, and `watch` merely warns on
 both). The recommended arc is to run `watch` through one real trip
 (approve, see the block, reverse it with your own hands), and only then
 consider `armed`.
+
+## 4.6 Optional: stop specific instances too
+
+The block stops *new* spend, but a big instance you already have keeps
+billing. For **long-lived instances you know about ahead of time** (a
+practice database, a dev box), you can have AWS stop them at the same
+threshold. List them in `.env`:
+
+```bash
+STOP_EC2_INSTANCES=i-0123456789abcdef0,us-west-2:i-0fedcba9876543210
+STOP_RDS_INSTANCES=practice-db
+```
+
+A bare ID means the region you deploy to. Prefix `region:` for anything
+else. Each region and type becomes one native budget action
+(`RUN_SSM_DOCUMENTS`), up to 100 instances each.
+
+What happens:
+
+- At the threshold, AWS Budgets runs AWS's own `AWS-StopEC2Instance` /
+  `AWS-StopRdsInstance` runbooks. Instances are **stopped, never terminated
+  or deleted**, so disks and data survive. EBS volumes and RDS storage keep
+  billing while stopped, but compute stops.
+- It follows `SAFETY` just like the block. In `watch` mode each stop action
+  goes `PENDING` and the email has a separate approve command for it. In
+  `armed` mode AWS stops them automatically.
+- AWS sends its own short notice for each stop action, and Radar's report
+  lists every stop action's status and instances.
+- Stopped instances **stay stopped** until someone starts them. While the
+  block is applied your learning identity can't start them either (the
+  deny covers `ec2:StartInstances` / `rds:StartDBInstance`), so start them
+  as your recovery principal. AWS **restarts a stopped RDS DB instance by
+  itself after 7 days**.
+- Like the block, a stop action runs once per budget month. Start an
+  instance again mid-month and it won't be re-stopped until the next month
+  (or a Reset, see 4.4 for the caveat).
+
+The preflight looks up every listed instance and **refuses to deploy**
+if one doesn't exist, is already terminated, or can't be stopped this way:
+
+- **Auto Scaling group members.** The group would just replace them. Scale
+  the group down yourself instead.
+- **Instance-store-backed EC2.** These can only be terminated.
+- **Aurora / DB cluster members, and RDS read replicas.** AWS can't stop
+  these individually.
+
+It warns on Spot Instances, since only Spot Instances from a persistent
+request can be stopped.
+
+**Why only listed instances?** AWS's native stop action needs the instance
+IDs when it's created, so it can't catch something you launch tomorrow. For
+that, lean on the block (no new launches) and the report's inventory.
+
+The execution role AWS uses is scoped to exactly these instances and only
+AWS's stop/start runbooks, and it can only act *through* Systems Manager. It
+can't terminate, delete, or modify anything.
 
 ---
 
@@ -425,7 +492,7 @@ Near-zero, but **not guaranteed $0.00**:
 
 | Item | Cost |
 |---|---|
-| The budget + action | Free (first 2 action-enabled budgets per account) |
+| The budget + action(s) | Free (first 2 action-enabled budgets per account; the optional stop actions live on the same budget) |
 | Lambda + SNS email | Free tier at this volume, Lambda only runs on a trip |
 | CloudWatch Logs | Pennies at most, capped by 30-day retention |
 | CDK bootstrap S3 | A few KB of storage, shared |

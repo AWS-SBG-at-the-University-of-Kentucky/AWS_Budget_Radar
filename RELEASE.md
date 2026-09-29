@@ -218,6 +218,23 @@ confirm, not just unit coverage.
    confirm the preflight rejects it (the "scoped budgets are rejected in
    v1" check) before any AWS mutation, matching the existing unit coverage
    for this rejection.
+9. **Native stop actions.** With one throwaway EBS-backed EC2 instance and
+   one small non-Aurora RDS instance listed in `STOP_EC2_INSTANCES` /
+   `STOP_RDS_INSTANCES`, confirm: (a) preflight passes for them and refuses
+   a made-up ID, an ASG member, and an Aurora cluster member; (b) in `watch`
+   mode each stop action goes `PENDING`, the Radar report lists both with
+   their own approve commands, and approving one stops exactly that
+   instance (stopped, not terminated); (c) in `armed` mode both stop
+   automatically and the action reaches `EXECUTION_SUCCESS`, which proves
+   the scoped `StopInstancesRole` (runbook ARNs, instance ARNs,
+   `aws:CalledVia` condition) is sufficient. If it reaches
+   `EXECUTION_FAILURE`, capture the SSM Automation execution's error before
+   changing the policy; (d) record what `REVERSE_BUDGET_ACTION` does on an
+   executed stop action (expected: restarts the instances, using the
+   granted start permissions) and whether AWS allows it at all; (e) record
+   the email(s) AWS itself sends for each stop action; (f) the covered
+   identity cannot start a stopped instance while the deny is applied, and
+   the recovery principal can.
 
 ---
 

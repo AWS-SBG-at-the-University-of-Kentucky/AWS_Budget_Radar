@@ -1284,3 +1284,148 @@ def test_execution_success_report_does_say_how_to_lift_the_block():
     )
     assert "the block is applied" in body.lower()
     assert handler._reverse_cli("111122223333", "my-budget", "aaaa-bbbb") in body
+
+
+# --- Native stop actions (RUN_SSM_DOCUMENTS) ---
+
+STOP_ID_1 = "22222222-2222-2222-2222-222222222222"
+STOP_ID_2 = "33333333-3333-3333-3333-333333333333"
+
+
+def _stop_action_response(action_id, status, subtype, region, ids):
+    return {"AccountId": "111122223333", "BudgetName": "b",
+            "Action": {"ActionId": action_id, "BudgetName": "b", "NotificationType": "ACTUAL",
+                       "ActionType": "RUN_SSM_DOCUMENTS",
+                       "ActionThreshold": {"ActionThresholdValue": 100.0, "ActionThresholdType": "PERCENTAGE"},
+                       "Definition": {"SsmActionDefinition": {
+                           "ActionSubType": subtype, "Region": region, "InstanceIds": ids}},
+                       "ExecutionRoleArn": "arn:aws:iam::111122223333:role/stop",
+                       "ApprovalModel": "MANUAL", "Status": status,
+                       "Subscribers": [{"SubscriptionType": "SNS",
+                                        "Address": "arn:aws:sns:us-east-1:111122223333:Report"}]}}
+
+
+def test_observe_stop_actions_reads_each_action(monkeypatch):
+    client = boto3.client("budgets", region_name="us-east-1")
+    stub = Stubber(client)
+    stub.add_response("describe_budget_action",
+        _stop_action_response(STOP_ID_1, "PENDING", "STOP_EC2_INSTANCES", "us-east-1", ["i-0123456789abcdef0"]),
+        {"AccountId": "111122223333", "BudgetName": "b", "ActionId": STOP_ID_1})
+    stub.add_response("describe_budget_action",
+        _stop_action_response(STOP_ID_2, "EXECUTION_SUCCESS", "STOP_RDS_INSTANCES", "us-west-2", ["labdb"]),
+        {"AccountId": "111122223333", "BudgetName": "b", "ActionId": STOP_ID_2})
+    stub.activate()
+    monkeypatch.setattr(handler, "_client", lambda svc, region=None: client)
+    out = handler.observe_stop_actions("111122223333", "b", [STOP_ID_1, STOP_ID_2])
+    assert out == [
+        {"action_id": STOP_ID_1, "status": "PENDING", "subtype": "STOP_EC2_INSTANCES",
+         "region": "us-east-1", "instance_ids": ["i-0123456789abcdef0"]},
+        {"action_id": STOP_ID_2, "status": "EXECUTION_SUCCESS", "subtype": "STOP_RDS_INSTANCES",
+         "region": "us-west-2", "instance_ids": ["labdb"]},
+    ]
+
+
+def test_observe_stop_actions_marks_a_failed_lookup_unknown_without_dropping_it(monkeypatch):
+    def boom(svc, region=None):
+        raise RuntimeError("AccessDenied")
+    monkeypatch.setattr(handler, "_client", boom)
+    out = handler.observe_stop_actions("111122223333", "b", [STOP_ID_1])
+    assert out == [{"action_id": STOP_ID_1, "status": "UNKNOWN", "subtype": None,
+                    "region": None, "instance_ids": []}]
+
+
+def test_stop_action_ids_parses_env(monkeypatch):
+    monkeypatch.setenv("STOP_ACTION_IDS", f"{STOP_ID_1}, {STOP_ID_2},")
+    assert handler._stop_action_ids() == [STOP_ID_1, STOP_ID_2]
+    monkeypatch.delenv("STOP_ACTION_IDS")
+    assert handler._stop_action_ids() == []
+
+
+def _inv():
+    return {"areas": [], "generated": "2026-09-15T00:00:00+00:00"}
+
+
+def test_report_without_stop_actions_keeps_the_original_wording():
+    body = handler.build_report("PENDING", "t", _inv(), "watch", account_id="111122223333",
+                                budget_name="b", action_id="a")
+    assert "This report does not stop anything" in body
+    assert "Stop actions" not in body
+
+
+def test_report_pending_stop_action_says_not_stopped_and_gives_its_own_approve_command():
+    stops = [{"action_id": STOP_ID_1, "status": "PENDING", "subtype": "STOP_EC2_INSTANCES",
+              "region": "us-east-1", "instance_ids": ["i-0123456789abcdef0", "i-0fedcba9876543210"]}]
+    body = handler.build_report("PENDING", "t", _inv(), "watch", account_id="111122223333",
+                                budget_name="b", action_id="a", stop_actions=stops)
+    assert "EC2 instances in us-east-1: i-0123456789abcdef0, i-0fedcba9876543210" in body
+    assert "NOT STOPPED YET" in body
+    assert f"--action-id {STOP_ID_1} --execution-type APPROVE_BUDGET_ACTION" in body
+    assert "Apart from the instances in the stop actions above" in body
+    assert "stay stopped until someone starts them" not in body  # nothing stopped yet
+
+
+def test_report_executed_stop_action_explains_restart_and_offers_no_approve():
+    stops = [{"action_id": STOP_ID_2, "status": "EXECUTION_SUCCESS", "subtype": "STOP_RDS_INSTANCES",
+              "region": "us-west-2", "instance_ids": ["labdb"]}]
+    body = handler.build_report("EXECUTION_SUCCESS", "t", _inv(), "armed", account_id="111122223333",
+                                budget_name="b", action_id="a", stop_actions=stops)
+    assert "RDS DB instances in us-west-2: labdb" in body
+    assert "status EXECUTION_SUCCESS -- the configured action WAS applied" in body
+    assert f"--action-id {STOP_ID_2} --execution-type APPROVE_BUDGET_ACTION" not in body
+    assert "stay stopped until someone starts them" in body
+    assert "restart them as the recovery principal" in body
+
+
+def test_report_unknown_stop_action_does_not_claim_a_stop():
+    stops = [{"action_id": STOP_ID_1, "status": "UNKNOWN", "subtype": None,
+              "region": None, "instance_ids": []}]
+    body = handler.build_report("EXECUTION_SUCCESS", "t", _inv(), "armed", account_id="111122223333",
+                                budget_name="b", action_id="a", stop_actions=stops)
+    assert "instances (type unknown) in unknown region: unknown (action lookup failed)" in body
+    assert "treat as unverified" in body
+    assert "stay stopped until someone starts them" not in body
+
+
+def test_handler_reports_stop_actions_when_configured(monkeypatch):
+    monkeypatch.setenv("TRIGGER_TOPIC_ARN", "arn:aws:sns:us-east-1:111122223333:Trigger")
+    monkeypatch.setenv("ACCOUNT_ID", "111122223333")
+    monkeypatch.setenv("BUDGET_NAME", "b")
+    monkeypatch.setenv("ACTION_ID", "11111111-1111-1111-1111-111111111111")
+    monkeypatch.setenv("REPORT_TOPIC_ARN", "arn:aws:sns:us-east-1:111122223333:Report")
+    monkeypatch.setenv("STOP_ACTION_IDS", STOP_ID_1)
+    seen = {}
+    monkeypatch.setattr(handler, "observe_action_status", lambda a, b, c: ("PENDING", "t", None))
+    monkeypatch.setattr(handler, "enabled_regions", lambda: [])
+    monkeypatch.setattr(handler, "s3_bucket_sizes", lambda deadline_epoch=None: [])
+
+    def fake_observe_stops(account_id, budget_name, ids):
+        seen["ids"] = ids
+        return [{"action_id": STOP_ID_1, "status": "PENDING", "subtype": "STOP_EC2_INSTANCES",
+                 "region": "us-east-1", "instance_ids": ["i-0123456789abcdef0"]}]
+
+    monkeypatch.setattr(handler, "observe_stop_actions", fake_observe_stops)
+    published = []
+    monkeypatch.setattr(handler, "publish", lambda t, s, b: published.append(b))
+    event = {"Records": [{"Sns": {"TopicArn": "arn:aws:sns:us-east-1:111122223333:Trigger"}}]}
+    handler.handler(event, None)
+    assert seen["ids"] == [STOP_ID_1]
+    assert "i-0123456789abcdef0" in published[0]
+
+
+def test_handler_skips_stop_lookup_when_none_configured(monkeypatch):
+    monkeypatch.setenv("TRIGGER_TOPIC_ARN", "arn:aws:sns:us-east-1:111122223333:Trigger")
+    monkeypatch.setenv("ACCOUNT_ID", "111122223333")
+    monkeypatch.setenv("BUDGET_NAME", "b")
+    monkeypatch.setenv("ACTION_ID", "11111111-1111-1111-1111-111111111111")
+    monkeypatch.setenv("REPORT_TOPIC_ARN", "arn:aws:sns:us-east-1:111122223333:Report")
+    monkeypatch.delenv("STOP_ACTION_IDS", raising=False)
+    monkeypatch.setattr(handler, "observe_action_status", lambda a, b, c: ("PENDING", "t", None))
+    monkeypatch.setattr(handler, "enabled_regions", lambda: [])
+    monkeypatch.setattr(handler, "s3_bucket_sizes", lambda deadline_epoch=None: [])
+    monkeypatch.setattr(handler, "observe_stop_actions",
+                        lambda *a: (_ for _ in ()).throw(AssertionError("should not be called")))
+    published = []
+    monkeypatch.setattr(handler, "publish", lambda t, s, b: published.append(b))
+    event = {"Records": [{"Sns": {"TopicArn": "arn:aws:sns:us-east-1:111122223333:Trigger"}}]}
+    handler.handler(event, None)
+    assert "This report does not stop anything" in published[0]

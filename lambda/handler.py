@@ -115,6 +115,35 @@ def observe_action_status(account_id, budget_name, action_id):
         return "UNKNOWN", _now_iso(), None
 
 
+def observe_stop_actions(account_id, budget_name, action_ids):
+    """Observed state of each native stop action (RUN_SSM_DOCUMENTS), in the
+    order given. A failed lookup is reported as UNKNOWN for that action only,
+    never dropped, so the report can't imply a stop that wasn't verified."""
+    out = []
+    for action_id in action_ids:
+        entry = {"action_id": action_id, "status": "UNKNOWN", "subtype": None,
+                 "region": None, "instance_ids": []}
+        try:
+            c = _client("budgets")
+            action = c.describe_budget_action(AccountId=account_id, BudgetName=budget_name,
+                                              ActionId=action_id)["Action"]
+            ssm_def = action.get("Definition", {}).get("SsmActionDefinition", {})
+            entry.update({
+                "status": action["Status"],
+                "subtype": ssm_def.get("ActionSubType"),
+                "region": ssm_def.get("Region"),
+                "instance_ids": ssm_def.get("InstanceIds", []),
+            })
+        except Exception:
+            pass
+        out.append(entry)
+    return out
+
+
+def _stop_action_ids():
+    return [a.strip() for a in os.environ.get("STOP_ACTION_IDS", "").split(",") if a.strip()]
+
+
 # --- Area outcome constants (per-region/per-service coverage state) ---
 COMPLETE, EMPTY, FAILED, UNSUPPORTED, NOT_SCANNED, PARTIAL = (
     "complete", "empty", "failed", "unsupported", "not_scanned", "partial",
@@ -636,9 +665,36 @@ def _budgets_console_url(account_id, budget_name):
     return f"https://console.aws.amazon.com/billing/home#/budgets/details?name={quote(budget_name)}"
 
 
+_STOP_SUBTYPE_LABEL = {"STOP_EC2_INSTANCES": "EC2 instances", "STOP_RDS_INSTANCES": "RDS DB instances"}
+
+
+def _stop_actions_section(stop_actions, account_id, budget_name):
+    """Per-stop-action status lines. Status-conditional like the deny's call
+    to action: an approve command only for PENDING, and no claim that
+    anything stopped unless AWS reports EXECUTION_SUCCESS."""
+    lines = ["Stop actions (AWS Budgets stops these listed instances itself; stopped, never terminated):"]
+    any_stopped = False
+    for sa in stop_actions:
+        what = _STOP_SUBTYPE_LABEL.get(sa.get("subtype"), "instances (type unknown)")
+        ids = ", ".join(sa.get("instance_ids") or []) or "unknown (action lookup failed)"
+        st = sa.get("status") or "UNKNOWN"
+        lines.append(f"    - {what} in {sa.get('region') or 'unknown region'}: {ids}")
+        lines.append(f"      status {st} -- {_status_narrative(st)}")
+        if st == "PENDING" and account_id and budget_name and sa.get("action_id"):
+            lines.append("      NOT STOPPED YET. To stop them now, run:")
+            lines.append(f"          {_approve_cli(account_id, budget_name, sa['action_id'])}")
+        if st == "EXECUTION_SUCCESS":
+            any_stopped = True
+    if any_stopped:
+        lines.append("    Stopped instances stay stopped until someone starts them (RDS restarts itself after")
+        lines.append("    7 days). While the block is applied, the covered identities can't start them, so")
+        lines.append("    restart them as the recovery principal once you're ready to spend again.")
+    return lines
+
+
 def build_report(status, status_ts, inv, safety, account_id=None, budget_name=None,
                   action_details=None, deadline_epoch=None, action_id=None,
-                  recovery_principal_arn=None):
+                  recovery_principal_arn=None, stop_actions=None):
     lines = []
     lines.append(f"AWS Budget Radar - {_status_headline(status)}.")
     lines.append("")
@@ -659,8 +715,14 @@ def build_report(status, status_ts, inv, safety, account_id=None, budget_name=No
     # reverse/undo command is the recovery route at the end of the report.
     lines.append(_call_to_action(status, account_id, budget_name, action_id))
     lines.append("")
-    lines.append("IMPORTANT: Workloads that are already running KEEP running until you stop them yourself.")
-    lines.append("This report does not stop anything - it only observes and informs.")
+    if stop_actions:
+        lines.extend(_stop_actions_section(stop_actions, account_id, budget_name))
+        lines.append("")
+        lines.append("IMPORTANT: Apart from the instances in the stop actions above, workloads that are already")
+        lines.append("running KEEP running until you stop them yourself. This report itself stops nothing.")
+    else:
+        lines.append("IMPORTANT: Workloads that are already running KEEP running until you stop them yourself.")
+        lines.append("This report does not stop anything - it only observes and informs.")
     lines.append("This is a best-effort inventory with explicit coverage gaps, not a complete bill or a")
     lines.append("guarantee that every costing resource is listed below.")
     lines.append("")
@@ -735,8 +797,10 @@ def handler(event, context):
     if region_failure_area is not None:
         inv["areas"].insert(0, region_failure_area)
     recovery_principal_arn = os.environ.get("RECOVERY_PRINCIPAL_ARN")
+    stop_ids = _stop_action_ids()
+    stop_actions = observe_stop_actions(account_id, budget_name, stop_ids) if stop_ids else None
     body = build_report(status, status_ts, inv, safety, account_id=account_id, budget_name=budget_name,
                          action_details=action_details, deadline_epoch=deadline, action_id=action_id,
-                         recovery_principal_arn=recovery_principal_arn)
+                         recovery_principal_arn=recovery_principal_arn, stop_actions=stop_actions)
     publish(report_topic, _report_subject(status), body)  # raises on failure
     return {"status": "reported", "action_status": status}

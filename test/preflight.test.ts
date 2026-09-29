@@ -17,6 +17,7 @@ function cfg(overrides: Partial<RadarConfig> = {}): RadarConfig {
     serviceBudgets: [],
     trackGrossUsage: true,
     excludeServices: [],
+    stopGroups: [],
     ...overrides
   };
 }
@@ -835,4 +836,115 @@ test("F10(c): rejects a GROUP ARN as the recovery principal with a specific mess
   );
   expect(r.ok).toBe(false);
   expect(r.messages.join("\n")).toMatch(/recovery principal must be an IAM user or role/i);
+});
+
+// --- Native stop actions (STOP_EC2_INSTANCES / STOP_RDS_INSTANCES) ---
+
+describe("stop-action targets", () => {
+  const savedRegion = { AWS_REGION: process.env.AWS_REGION, CDK_DEFAULT_REGION: process.env.CDK_DEFAULT_REGION };
+  beforeEach(() => { process.env.AWS_REGION = "us-east-1"; delete process.env.CDK_DEFAULT_REGION; });
+  afterAll(() => {
+    for (const [k, v] of Object.entries(savedRegion)) {
+      if (v === undefined) delete process.env[k]; else process.env[k] = v;
+    }
+  });
+
+  const okEc2 = async () => ({ state: "running", rootDeviceType: "ebs" });
+  const okRds = async () => ({ status: "available" });
+  const ec2Cfg = cfg({ stopGroups: [{ kind: "EC2", ids: ["i-0123456789abcdef0"] }] });
+  const rdsCfg = cfg({ stopGroups: [{ kind: "RDS", region: "us-west-2", ids: ["labdb"] }] });
+  const text = (r: { messages: string[] }) => r.messages.join("\n");
+
+  test("no stop targets: no EC2/RDS lookups at all", async () => {
+    const r = await runPreflight(cfg(), deps({
+      describeEc2Instance: async () => { throw new Error("should not be called"); },
+      describeRdsInstance: async () => { throw new Error("should not be called"); }
+    }));
+    expect(r.ok).toBe(true);
+    expect(text(r)).not.toMatch(/STOP_/);
+  });
+
+  test("valid EC2 and RDS targets pass, with a deploy summary naming the counts and approval mode", async () => {
+    const seen: string[] = [];
+    const r = await runPreflight(
+      cfg({ stopGroups: [...ec2Cfg.stopGroups, ...rdsCfg.stopGroups] }),
+      deps({
+        describeEc2Instance: async (region, id) => { seen.push(`ec2 ${region} ${id}`); return okEc2(); },
+        describeRdsInstance: async (region, id) => { seen.push(`rds ${region} ${id}`); return okRds(); }
+      })
+    );
+    expect(r.ok).toBe(true);
+    expect(seen).toEqual(["ec2 us-east-1 i-0123456789abcdef0", "rds us-west-2 labdb"]); // bare ID -> deploy region
+    expect(text(r)).toMatch(/STOP \(never terminate\) 1 EC2 instance\(s\) and 1 RDS DB instance\(s\) \(after your approval/);
+    expect(text(r)).toMatch(/restarts a stopped DB instance after 7 days/);
+  });
+
+  test("armed mode says the stop is automatic", async () => {
+    const r = await runPreflight(cfg({ ...ec2Cfg, safety: "armed" }), deps({ describeEc2Instance: okEc2 }));
+    expect(text(r)).toMatch(/instance\(s\) \(automatically\)/);
+  });
+
+  test.each([
+    ["missing instance", async () => null, /no such instance/],
+    ["terminated instance", async () => ({ state: "terminated" }), /terminated/],
+    ["Auto Scaling group member", async () => ({ state: "running", asgName: "web-asg" }), /Auto Scaling group "web-asg"/],
+    ["instance-store root", async () => ({ state: "running", rootDeviceType: "instance-store" }), /instance-store/],
+    ["lookup error", async () => { throw Object.assign(new Error("denied"), { name: "UnauthorizedOperation" }); },
+      /lookup failed \(UnauthorizedOperation/]
+  ])("fails closed on an EC2 %s", async (_label, impl, err) => {
+    const r = await runPreflight(ec2Cfg, deps({ describeEc2Instance: impl as any }));
+    expect(r.ok).toBe(false);
+    expect(text(r)).toMatch(err);
+  });
+
+  test("warns (not fails) on a Spot Instance", async () => {
+    const r = await runPreflight(ec2Cfg, deps({
+      describeEc2Instance: async () => ({ state: "running", rootDeviceType: "ebs", lifecycle: "spot" })
+    }));
+    expect(r.ok).toBe(true);
+    expect(text(r)).toMatch(/WARNING: .*Spot Instance/);
+  });
+
+  test.each([
+    ["missing DB instance", async () => null, /no such DB instance/],
+    ["cluster member", async () => ({ status: "available", clusterId: "aurora-1" }), /member of DB cluster "aurora-1"/],
+    ["read replica", async () => ({ status: "available", replicaSource: "primary-db" }), /read replica of "primary-db"/],
+    ["lookup error", async () => { throw Object.assign(new Error("denied"), { name: "AccessDenied" }); },
+      /rds:DescribeDBInstances/]
+  ])("fails closed on an RDS %s", async (_label, impl, err) => {
+    const r = await runPreflight(rdsCfg, deps({ describeRdsInstance: impl as any }));
+    expect(r.ok).toBe(false);
+    expect(text(r)).toMatch(err);
+  });
+
+  test("fails closed when the lookup dependency is missing", async () => {
+    const r = await runPreflight(ec2Cfg, deps());
+    expect(r.ok).toBe(false);
+    expect(text(r)).toMatch(/EC2 lookup unavailable/);
+  });
+
+  test("fails when a bare ID's deploy region can't be resolved", async () => {
+    delete process.env.AWS_REGION;
+    const r = await runPreflight(ec2Cfg, deps({ describeEc2Instance: okEc2 }));
+    expect(r.ok).toBe(false);
+    expect(text(r)).toMatch(/deploy region, but it isn't resolvable/);
+  });
+});
+
+test("stop targets: bare IDs fall back to the SDK-resolved region when no region env var is set", async () => {
+  const saved = { AWS_REGION: process.env.AWS_REGION, CDK_DEFAULT_REGION: process.env.CDK_DEFAULT_REGION };
+  delete process.env.AWS_REGION; delete process.env.CDK_DEFAULT_REGION;
+  try {
+    const seen: string[] = [];
+    const r = await runPreflight(cfg({ stopGroups: [{ kind: "EC2", ids: ["i-12345678"] }] }), deps({
+      resolveDeployRegion: async () => "eu-central-1",
+      describeEc2Instance: async (region) => { seen.push(region); return { state: "running", rootDeviceType: "ebs" }; }
+    }));
+    expect(r.ok).toBe(true);
+    expect(seen).toEqual(["eu-central-1"]);
+  } finally {
+    for (const [k, v] of Object.entries(saved)) {
+      if (v === undefined) delete process.env[k]; else process.env[k] = v;
+    }
+  }
 });

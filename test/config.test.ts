@@ -124,3 +124,40 @@ test("parses SERVICE_BUDGETS list", () => {
     { service: "Amazon SageMaker", limitUsd: 10 }
   ]);
 });
+
+// --- Native stop actions (STOP_EC2_INSTANCES / STOP_RDS_INSTANCES) ---
+
+test("no STOP_* configured means no stop groups (nothing is ever stopped by default)", () => {
+  expect(loadConfig({ ...base } as any).stopGroups).toEqual([]);
+});
+
+test("bare IDs go to the deploy region; region:id entries are grouped per region; duplicates dropped", () => {
+  const c = loadConfig({
+    ...base,
+    STOP_EC2_INSTANCES: "i-0123456789abcdef0, us-west-2:i-0fedcba9876543210, i-0123456789abcdef0, i-12345678",
+    STOP_RDS_INSTANCES: "LabDB, eu-west-1:other-db"
+  } as any);
+  expect(c.stopGroups).toEqual([
+    { kind: "EC2", region: undefined, ids: ["i-0123456789abcdef0", "i-12345678"] },
+    { kind: "EC2", region: "us-west-2", ids: ["i-0fedcba9876543210"] },
+    { kind: "RDS", region: undefined, ids: ["labdb"] },            // RDS identifiers are lowercased
+    { kind: "RDS", region: "eu-west-1", ids: ["other-db"] }
+  ]);
+});
+
+test.each([
+  ["STOP_EC2_INSTANCES", "i-xyz", /EC2 instance ID/],
+  ["STOP_EC2_INSTANCES", "ami-0123456789abcdef0", /EC2 instance ID/],
+  ["STOP_EC2_INSTANCES", "useast1:i-0123456789abcdef0", /invalid region/],
+  ["STOP_RDS_INSTANCES", "1db", /RDS DB instance identifier/],
+  ["STOP_RDS_INSTANCES", "db-", /RDS DB instance identifier/],
+  ["STOP_RDS_INSTANCES", "my--db", /RDS DB instance identifier/],
+  ["STOP_RDS_INSTANCES", "arn:aws:rds:us-east-1:111122223333:db:x", /invalid region/]
+])("rejects %s=%s", (name, value, err) => {
+  expect(() => loadConfig({ ...base, [name]: value } as any)).toThrow(err);
+});
+
+test("rejects more than 100 instances in one region (AWS limit per stop action)", () => {
+  const ids = Array.from({ length: 101 }, (_, i) => `i-${i.toString(16).padStart(8, "0")}`).join(",");
+  expect(() => loadConfig({ ...base, STOP_EC2_INSTANCES: ids } as any)).toThrow(/at most 100/);
+});

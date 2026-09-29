@@ -8,7 +8,7 @@ import * as sqs from "aws-cdk-lib/aws-sqs";
 import * as logs from "aws-cdk-lib/aws-logs";
 import * as destinations from "aws-cdk-lib/aws-lambda-destinations";
 import * as path from "path";
-import { RadarConfig } from "./config";
+import { RadarConfig, StopGroup, StopKind } from "./config";
 import { denyPolicyDocument } from "./deny-policy";
 
 export interface BudgetRadarStackProps extends cdk.StackProps { config: RadarConfig; }
@@ -20,6 +20,9 @@ export class BudgetRadarStack extends cdk.Stack {
   readonly denyPolicy: iam.ManagedPolicy;
   readonly actionRole: iam.Role;
   readonly failureQueue: sqs.Queue;
+  // Native stop actions; empty (and no stopRole) unless STOP_* is configured.
+  readonly stopActions: cdk.aws_budgets.CfnBudgetsAction[];
+  readonly stopRole?: iam.Role;
 
   constructor(scope: Construct, id: string, props: BudgetRadarStackProps) {
     super(scope, id, props);
@@ -229,6 +232,52 @@ export class BudgetRadarStack extends cdk.Stack {
     this.reporter.addEnvironment("BUDGET_NAME", budgetName);
     this.reporter.addEnvironment("ACTION_ID", action.attrActionId);
 
+    // --- Optional native stop actions (STOP_EC2_INSTANCES / STOP_RDS_INSTANCES). ---
+    // AWS Budgets itself runs the AWS-StopEC2Instance / AWS-StopRdsInstance
+    // SSM runbooks at the same threshold as the deny. Stop, never terminate or
+    // delete, so no data is lost. The reporter stays read-only.
+    this.stopActions = [];
+    const stopGroups = this.mergeStopGroups(config.stopGroups);
+    if (stopGroups.length > 0) {
+      this.stopRole = new iam.Role(this, "StopInstancesRole", {
+        assumedBy: new iam.ServicePrincipal("budgets.amazonaws.com", {
+          conditions: {
+            StringEquals: { "aws:SourceAccount": account },
+            ArnLike: { "aws:SourceArn": `arn:aws:budgets::${account}:*` }
+          }
+        })
+      });
+      this.grantStopPermissions(this.stopRole, stopGroups, account);
+      const stopRolePolicy = this.stopRole.node.tryFindChild("DefaultPolicy");
+
+      for (const g of stopGroups) {
+        const stop = new cdk.aws_budgets.CfnBudgetsAction(this, `Stop${g.kind}${this.regionSlug(g.region)}`, {
+          budgetName,
+          actionThreshold: { type: "PERCENTAGE", value: config.actionThresholdPercent },
+          actionType: "RUN_SSM_DOCUMENTS",
+          approvalModel: config.safety === "armed" ? "AUTOMATIC" : "MANUAL",
+          notificationType: config.actionThresholdType,
+          executionRoleArn: this.stopRole.roleArn,
+          definition: {
+            ssmActionDefinition: {
+              subtype: g.kind === "EC2" ? "STOP_EC2_INSTANCES" : "STOP_RDS_INSTANCES",
+              region: g.region,
+              instanceIds: g.ids
+            }
+          },
+          // AWS's own action notice goes straight to the email topic. Only the
+          // deny action drives the reporter, whose single report also lists
+          // every stop action's status (one email per trip, not one per action).
+          subscribers: [{ type: "SNS", address: this.reportTopic.topicArn }]
+        });
+        if (budget) stop.node.addDependency(budget);
+        if (stopRolePolicy) stop.node.addDependency(stopRolePolicy);
+        if (reportPolicy.policyDependable) stop.node.addDependency(reportPolicy.policyDependable);
+        this.stopActions.push(stop);
+      }
+      this.reporter.addEnvironment("STOP_ACTION_IDS", cdk.Fn.join(",", this.stopActions.map(a => a.attrActionId)));
+    }
+
     // --- Optional per-service warn budgets (notification-only, free). ---
     for (const [i, sb] of config.serviceBudgets.entries()) {
       const svcBudget = new cdk.aws_budgets.CfnBudget(this, `ServiceBudget${i}`, {
@@ -247,6 +296,91 @@ export class BudgetRadarStack extends cdk.Stack {
       });
       // Also publishes its warn notification to the report topic.
       if (reportPolicy.policyDependable) svcBudget.node.addDependency(reportPolicy.policyDependable);
+    }
+  }
+
+  // Resolves each group's region (undefined = this stack's region) and merges
+  // groups that land in the same concrete region, so "i-1" and
+  // "us-east-1:i-2" deployed to us-east-1 become one action, not two.
+  private mergeStopGroups(groups: StopGroup[]): Array<StopGroup & { region: string }> {
+    const merged = new Map<string, StopGroup & { region: string }>();
+    for (const g of groups) {
+      const region = g.region ?? this.region;
+      // An unresolved (token) deploy region can't be compared, so it keeps
+      // its own group.
+      const key = `${g.kind}|${cdk.Token.isUnresolved(region) ? "(deploy region)" : region}`;
+      const existing = merged.get(key);
+      if (existing) {
+        for (const id of g.ids) if (!existing.ids.includes(id)) existing.ids.push(id);
+      } else {
+        merged.set(key, { kind: g.kind, region, ids: [...g.ids] });
+      }
+    }
+    for (const g of merged.values()) {
+      if (g.ids.length > 100) {
+        throw new Error(`${g.kind} stop list has ${g.ids.length} instances in ${g.region}; AWS allows at most 100 per region.`);
+      }
+    }
+    return [...merged.values()];
+  }
+
+  private regionSlug(region: string): string {
+    return cdk.Token.isUnresolved(region) ? "DeployRegion" : region.replace(/-/g, "");
+  }
+
+  // Mirrors AWS's managed AWSBudgetsActions_RolePolicyForResourceAdministrationWithSSM,
+  // scoped down: only the AWS stop/start runbooks in the configured regions,
+  // and stop/start only on the exact listed instances. Budgets starts the
+  // runbook with this role and SSM then calls EC2/RDS on its behalf, hence the
+  // aws:CalledVia condition. Start is granted so reversing a stop action (which
+  // restarts the instances) can work.
+  private grantStopPermissions(role: iam.Role, groups: Array<StopGroup & { region: string }>, account: string): void {
+    const calledViaSsm = { "ForAnyValue:StringEquals": { "aws:CalledVia": ["ssm.amazonaws.com"] } };
+    const regions = [...new Set(groups.map(g => g.region))];
+    const docsFor = (kind: StopKind) => kind === "EC2"
+      ? ["AWS-StopEC2Instance", "AWS-StartEC2Instance"]
+      : ["AWS-StopRdsInstance", "AWS-StartRdsInstance"];
+    const kinds = [...new Set(groups.map(g => g.kind))];
+    const ssmResources: string[] = [];
+    for (const region of regions) {
+      for (const kind of kinds) {
+        for (const doc of docsFor(kind)) {
+          ssmResources.push(`arn:${this.partition}:ssm:${region}:*:document/${doc}`);
+          ssmResources.push(`arn:${this.partition}:ssm:${region}:*:automation-definition/${doc}:*`);
+        }
+      }
+      ssmResources.push(`arn:${this.partition}:ssm:${region}:${account}:automation-execution/*`);
+    }
+    role.addToPolicy(new iam.PolicyStatement({
+      actions: ["ssm:StartAutomationExecution"],
+      resources: ssmResources
+    }));
+
+    const ec2 = groups.filter(g => g.kind === "EC2");
+    if (ec2.length) {
+      role.addToPolicy(new iam.PolicyStatement({
+        actions: ["ec2:StopInstances", "ec2:StartInstances"],
+        resources: ec2.flatMap(g => g.ids.map(id => `arn:${this.partition}:ec2:${g.region}:${account}:instance/${id}`)),
+        conditions: calledViaSsm
+      }));
+      role.addToPolicy(new iam.PolicyStatement({
+        actions: ["ec2:DescribeInstanceStatus"],
+        resources: ["*"],  // Describe* cannot be scoped to a resource
+        conditions: calledViaSsm
+      }));
+    }
+    const rds = groups.filter(g => g.kind === "RDS");
+    if (rds.length) {
+      role.addToPolicy(new iam.PolicyStatement({
+        actions: ["rds:StopDBInstance", "rds:StartDBInstance"],
+        resources: rds.flatMap(g => g.ids.map(id => `arn:${this.partition}:rds:${g.region}:${account}:db:${id}`)),
+        conditions: calledViaSsm
+      }));
+      role.addToPolicy(new iam.PolicyStatement({
+        actions: ["rds:DescribeDBInstances"],
+        resources: ["*"],
+        conditions: calledViaSsm
+      }));
     }
   }
 
