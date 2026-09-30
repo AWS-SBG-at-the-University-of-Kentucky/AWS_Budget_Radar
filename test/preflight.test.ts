@@ -18,6 +18,9 @@ function cfg(overrides: Partial<RadarConfig> = {}): RadarConfig {
     trackGrossUsage: true,
     excludeServices: [],
     stopGroups: [],
+
+    dailyDigest: true,
+    dailyDigestHourUtc: 13,
     ...overrides
   };
 }
@@ -849,7 +852,7 @@ describe("stop-action targets", () => {
     }
   });
 
-  const okEc2 = async () => ({ state: "running", rootDeviceType: "ebs" });
+  const okEc2 = async () => ({ state: "running", rootDeviceType: "ebs", disableApiStop: false, instanceStorageSupported: false });
   const okRds = async () => ({ status: "available" });
   const ec2Cfg = cfg({ stopGroups: [{ kind: "EC2", ids: ["i-0123456789abcdef0"] }] });
   const rdsCfg = cfg({ stopGroups: [{ kind: "RDS", region: "us-west-2", ids: ["labdb"] }] });
@@ -899,7 +902,7 @@ describe("stop-action targets", () => {
 
   test("warns (not fails) on a Spot Instance", async () => {
     const r = await runPreflight(ec2Cfg, deps({
-      describeEc2Instance: async () => ({ state: "running", rootDeviceType: "ebs", lifecycle: "spot" })
+      describeEc2Instance: async () => ({ state: "running", rootDeviceType: "ebs", disableApiStop: false, instanceStorageSupported: false, lifecycle: "spot" })
     }));
     expect(r.ok).toBe(true);
     expect(text(r)).toMatch(/WARNING: .*Spot Instance/);
@@ -938,7 +941,7 @@ test("stop targets: bare IDs fall back to the SDK-resolved region when no region
     const seen: string[] = [];
     const r = await runPreflight(cfg({ stopGroups: [{ kind: "EC2", ids: ["i-12345678"] }] }), deps({
       resolveDeployRegion: async () => "eu-central-1",
-      describeEc2Instance: async (region) => { seen.push(region); return { state: "running", rootDeviceType: "ebs" }; }
+      describeEc2Instance: async (region) => { seen.push(region); return { state: "running", rootDeviceType: "ebs", disableApiStop: false, instanceStorageSupported: false }; }
     }));
     expect(r.ok).toBe(true);
     expect(seen).toEqual(["eu-central-1"]);
@@ -947,4 +950,58 @@ test("stop targets: bare IDs fall back to the SDK-resolved region when no region
       if (v === undefined) delete process.env[k]; else process.env[k] = v;
     }
   }
+});
+
+// Combined stop safety regressions: original preflight with only mocked AWS reads.
+describe("stop lifecycle safety", () => {
+  const safe = { state: "running", rootDeviceType: "ebs", disableApiStop: false, instanceStorageSupported: false };
+  const config = cfg({ stopGroups: [{ kind: "EC2", region: "us-east-1", ids: ["i-0123456789abcdef0"] }] });
+  test.each([
+    ["API stop protection", { ...safe, disableApiStop: true }, /API stop protection/],
+    ["unverified protection", { ...safe, disableApiStop: undefined }, /unverified/],
+    ["EBS-root local storage", { ...safe, instanceStorageSupported: true }, /instance-store data/],
+    ["unknown storage", { ...safe, instanceStorageSupported: undefined }, /unverified/]
+  ])("rejects %s without mutating attributes", async (_name, info, message) => {
+    const result = await runPreflight(config, deps({ describeEc2Instance: async () => info }));
+    expect(result.ok).toBe(false);
+    expect(result.messages.join("\n")).toMatch(message);
+  });
+  test.each([
+    ["read-replica source", { status: "available", replicaIds: ["child"] }, /has read replicas/],
+    ["SQL Server Multi-AZ", { status: "available", engine: "sqlserver-se", multiAZ: true }, /SQL Server Multi-AZ/]
+  ])("rejects RDS %s", async (_name, info, message) => {
+    const result = await runPreflight(cfg({ stopGroups: [{ kind: "RDS", region: "us-east-1", ids: ["labdb"] }] }),
+      deps({ describeRdsInstance: async () => info }));
+    expect(result.ok).toBe(false);
+    expect(result.messages.join("\n")).toMatch(message);
+  });
+  test("conflicting deploy regions fail before any AWS lookup", async () => {
+    const previous = { AWS_REGION: process.env.AWS_REGION, CDK_DEFAULT_REGION: process.env.CDK_DEFAULT_REGION };
+    process.env.AWS_REGION = "us-east-1"; process.env.CDK_DEFAULT_REGION = "us-west-2";
+    try {
+      const result = await runPreflight(config, deps({ getCallerIdentity: async () => { throw new Error("must not call AWS"); } }));
+      expect(result.ok).toBe(false);
+      expect(result.messages.join("\n")).toMatch(/conflicts/);
+    } finally {
+      for (const [key, value] of Object.entries(previous)) {
+        if (value === undefined) delete process.env[key]; else process.env[key] = value;
+      }
+    }
+  });
+});
+
+test("AWS response mapping retains stop protection/local storage and RDS restrictions", async () => {
+  const { ec2StopInfo, rdsStopInfo } = await import("../preflight");
+  const result = await runPreflight(cfg({ stopGroups: [{ kind: "EC2", region: "us-east-1", ids: ["i-0123456789abcdef0"] }] }),
+    deps({ describeEc2Instance: async () => ec2StopInfo(
+      { State: { Name: "running" }, RootDeviceType: "ebs", InstanceType: "m5d.large" },
+      { DisableApiStop: { Value: false } }, { InstanceType: "m5d.large", InstanceStorageSupported: true }) }));
+  expect(result.ok).toBe(false);
+  expect(result.messages.join("\n")).toMatch(/instance-store data/);
+  const protectedInfo = ec2StopInfo({ RootDeviceType: "ebs" }, { DisableApiStop: { Value: true } }, { InstanceStorageSupported: false });
+  expect(protectedInfo.disableApiStop).toBe(true);
+  const rds = await runPreflight(cfg({ stopGroups: [{ kind: "RDS", region: "us-east-1", ids: ["labdb"] }] }),
+    deps({ describeRdsInstance: async () => rdsStopInfo({ DBInstanceStatus: "available", ReadReplicaDBInstanceIdentifiers: ["child"], Engine: "postgres", MultiAZ: false }) }));
+  expect(rds.ok).toBe(false);
+  expect(rds.messages.join("\n")).toMatch(/has read replicas/);
 });

@@ -160,4 +160,47 @@ test.each([
 test("rejects more than 100 instances in one region (AWS limit per stop action)", () => {
   const ids = Array.from({ length: 101 }, (_, i) => `i-${i.toString(16).padStart(8, "0")}`).join(",");
   expect(() => loadConfig({ ...base, STOP_EC2_INSTANCES: ids } as any)).toThrow(/at most 100/);
+
+});
+
+// --- Daily digest ---
+
+test("daily digest defaults to disabled at 13:00 UTC", () => {
+  const c = loadConfig({ ...base } as any);
+  expect(c.dailyDigest).toBe(false);
+  expect(c.dailyDigestHourUtc).toBe(13);
+});
+
+test("empty DAILY_DIGEST / DAILY_DIGEST_HOUR_UTC fall back to the defaults", () => {
+  const c = loadConfig({ ...base, DAILY_DIGEST: " ", DAILY_DIGEST_HOUR_UTC: "" } as any);
+  expect(c.dailyDigest).toBe(false);
+  expect(c.dailyDigestHourUtc).toBe(13);
+});
+
+test.each(["true", "false"])("accepts DAILY_DIGEST=%s", mode => {
+  expect(loadConfig({ ...base, DAILY_DIGEST: mode } as any).dailyDigest).toBe(mode === "true");
+});
+
+test("rejects an unknown DAILY_DIGEST mode", () => {
+  expect(() => loadConfig({ ...base, DAILY_DIGEST: "weekly" } as any)).toThrow(/DAILY_DIGEST/);
+});
+
+test("accepts DAILY_DIGEST_HOUR_UTC at both ends of the day", () => {
+  expect(loadConfig({ ...base, DAILY_DIGEST_HOUR_UTC: "0" } as any).dailyDigestHourUtc).toBe(0);
+  expect(loadConfig({ ...base, DAILY_DIGEST_HOUR_UTC: "23" } as any).dailyDigestHourUtc).toBe(23);
+});
+
+test.each(["24", "-1", "9.5", "nine"])("rejects DAILY_DIGEST_HOUR_UTC=%s", hour => {
+  expect(() => loadConfig({ ...base, DAILY_DIGEST_HOUR_UTC: hour } as any)).toThrow(/DAILY_DIGEST_HOUR_UTC/);
+});
+
+test.each(["findings", "always", "off", "1"])("rejects legacy DAILY_DIGEST=%s explicitly", value => {
+  expect(() => loadConfig({ ...base, DAILY_DIGEST: value } as any)).toThrow(/DAILY_DIGEST must be "true" or "false"/);
+});
+
+test("synth and preflight share explicit deployment region resolution", () => {
+  const { deployRegionFromEnv } = require("../lib/config");
+  expect(deployRegionFromEnv({ AWS_REGION: "us-east-1" })).toBe("us-east-1");
+  expect(deployRegionFromEnv({ CDK_DEFAULT_REGION: "us-west-2" })).toBe("us-west-2");
+  expect(() => deployRegionFromEnv({ AWS_REGION: "us-east-1", CDK_DEFAULT_REGION: "us-west-2" })).toThrow(/conflicts/);
 });

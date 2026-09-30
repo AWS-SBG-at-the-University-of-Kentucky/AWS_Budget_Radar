@@ -230,11 +230,25 @@ confirm, not just unit coverage.
    `aws:CalledVia` condition) is sufficient. If it reaches
    `EXECUTION_FAILURE`, capture the SSM Automation execution's error before
    changing the policy; (d) record what `REVERSE_BUDGET_ACTION` does on an
-   executed stop action (expected: restarts the instances, using the
-   granted start permissions) and whether AWS allows it at all; (e) record
+   executed stop action (unverified: do not assume restart; inspect current resource state) and whether AWS allows it at all; (e) record
    the email(s) AWS itself sends for each stop action; (f) the covered
    identity cannot start a stopped instance while the deny is applied, and
    the recovery principal can.
+
+10. **Daily digest.** Deploy with `DAILY_DIGEST=true` and a
+   `DAILY_DIGEST_HOUR_UTC` a little ahead of now, and confirm: (a) the
+   scheduled run invokes `DigestReporter` and the digest email arrives with
+   month-to-date spend populated (not "unavailable"); (b) a direct
+   `aws lambda invoke` of `DigestReporter` with a hand-made payload returns
+   `{"status": "ignored"}` (only the stack's own rule ARN is accepted);
+   (c) launch one small EC2 instance, redeploy with `DAILY_DIGEST=true`,
+   and confirm the next run emails it, then terminate it and confirm the
+   following run still sends an email reporting no running findings; (d) under a
+   `PENDING` watch-mode action, the digest subject reads "block awaiting
+   your approval" and the body carries the approve command; (e) record the
+   scan's wall-clock duration from the function's logs across all enabled
+   regions; (f) `DAILY_DIGEST=false` removes the function and rule on
+   redeploy.
 
 ---
 
@@ -246,3 +260,9 @@ pass/fail. Attach or link the captured artifacts from item 9. A release is
 not "accepted" until every item has a recorded pass in the same disposable
 account within a single acceptance session (or a documented set of sessions
 covering all items).
+
+Integration acceptance (requires separate authorization; never run by local tests):
+verify failure-queue delivery for EventBridge invoke failures and exhausted async
+execution, reject an original schedule timestamp older than two hours, and confirm
+that each configured stop status appears in the daily email. Local regression
+coverage validates these paths with mocks and synthesized templates only.

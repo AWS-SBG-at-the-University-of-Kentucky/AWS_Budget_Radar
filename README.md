@@ -10,6 +10,12 @@ budget. If your spending crosses it, Budget Radar does two things.
    everything currently running and everything still costing you money, so
    you know exactly what to go turn off.
 
+Set `DAILY_DIGEST=true` to receive a **daily digest**, including quiet days,
+whether or not the budget has tripped. Billing data lags up to a day, so
+this can catch a forgotten notebook before it shows up as spend. The safe
+default is `false`, which creates no digest schedule
+(see [The daily digest](#the-daily-digest)).
+
 You clone it, fill in one config file, run one deploy command, and let it
 sit. It costs (almost) nothing to run.
 
@@ -49,6 +55,18 @@ Optionally, the same threshold can also **stop specific EC2/RDS instances**
 you list in `.env`. AWS Budgets does that itself by running AWS's own stop
 runbooks, so they're stopped, never terminated (see 4.6).
 
+Separately, once a day:
+
+```
+EventBridge schedule (DAILY_DIGEST_HOUR_UTC, default 13:00 UTC)
+        │
+        ▼
+ Radar's digest Lambda (read-only) scans the same regions and services
+        │
+        ▼
+ 📧 email every day when DAILY_DIGEST=true, including empty/incomplete scans
+```
+
 Two modes, set by one line of config:
 
 - **`watch` (default)** makes the block *wait for your approval*. The email
@@ -74,7 +92,7 @@ budget month starts**, or sooner if you reverse it (Part 4).
 | 2.3 | `npx cdk bootstrap` (once per account/region) | "Environment bootstrapped" |
 | 3.1 | `npm run deploy` | "Preflight passed" then `✅ BudgetRadarStack` |
 | 3.2 | Click the SNS confirmation email | `npm run verify` shows no `PendingConfirmation` |
-|  | *Let it sit.* | You get an email if the budget ever trips |
+|  | *Let it sit.* | You get an email if the budget ever trips, and a morning digest on days something is running |
 | 4 | On a trip, approve / lift the block | You know both commands (they're in the email) |
 | 5 | Someday, remove it | Reverse → verify detached → `cdk destroy` |
 
@@ -178,6 +196,13 @@ Less-common fields (all explained in the comments in `.env.example`):
   long-lived instances that AWS should **stop** at the same threshold as the
   block. Empty means nothing is ever stopped. See
   [4.6](#46-optional-stop-specific-instances-too).
+
+- `DAILY_DIGEST` (default **false**) is a true/false toggle. `true` emails every
+  day; `false` creates no daily schedule or digest function. This opt-in default
+  preserves existing deployments and avoids adding unsolicited daily email/cost.
+  Legacy `findings`, `always`, and `off` values are rejected with a validation error:
+  replace them deliberately with `true` or `false`. `DAILY_DIGEST_HOUR_UTC`
+  defaults to `13` and accepts whole hours 0–23, without daylight-saving adjustment.
 
 ## 2.3 One-time bootstrap
 
@@ -363,8 +388,10 @@ What happens:
 
 - At the threshold, AWS Budgets runs AWS's own `AWS-StopEC2Instance` /
   `AWS-StopRdsInstance` runbooks. Instances are **stopped, never terminated
-  or deleted**, so disks and data survive. EBS volumes and RDS storage keep
-  billing while stopped, but compute stops.
+  or deleted**. EBS and RDS persistent storage is retained, but EC2 instance-store
+  data is erased by a stop. Preflight rejects instance-storage-capable EC2 types,
+  including EBS-root types with local disks. Storage, provisioned IOPS, backups
+  and applicable IP charges continue; stopping reduces compute charges.
 - It follows `SAFETY` just like the block. In `watch` mode each stop action
   goes `PENDING` and the email has a separate approve command for it. In
   `armed` mode AWS stops them automatically.
@@ -374,7 +401,8 @@ What happens:
   block is applied your learning identity can't start them either (the
   deny covers `ec2:StartInstances` / `rds:StartDBInstance`), so start them
   as your recovery principal. AWS **restarts a stopped RDS DB instance by
-  itself after 7 days**.
+  itself after 7 days**, even while the learner deny remains applied; compute
+  charges resume and this monthly action does not continuously re-stop it.
 - Like the block, a stop action runs once per budget month. Start an
   instance again mid-month and it won't be re-stopped until the next month
   (or a Reset, see 4.4 for the caveat).
@@ -384,9 +412,12 @@ if one doesn't exist, is already terminated, or can't be stopped this way:
 
 - **Auto Scaling group members.** The group would just replace them. Scale
   the group down yourself instead.
-- **Instance-store-backed EC2.** These can only be terminated.
-- **Aurora / DB cluster members, and RDS read replicas.** AWS can't stop
-  these individually.
+- **Instance-store-backed or instance-storage-capable EC2 types.** Root type alone
+  cannot establish data safety; unknown storage capability also fails closed.
+- **API stop protection.** `DisableApiStop` must be verified false. Radar never
+  changes this attribute or grants the stop role permission to modify it.
+- **Aurora / DB cluster members, read replicas and instances with replicas,
+  and SQL Server Multi-AZ.** AWS cannot stop these this way.
 
 It warns on Spot Instances, since only Spot Instances from a persistent
 request can be stopped.
@@ -430,7 +461,10 @@ aws iam detach-group-policy --group-name <name> --policy-arn <DenyNewSpendPolicy
 aws iam detach-role-policy  --role-name  <name> --policy-arn <DenyNewSpendPolicyArn>
 ```
 
-Nothing ever needs restarting on uninstall, because nothing was stopped.
+If native stop actions were configured, inspect the current EC2/RDS state
+and recover resources using an authorized operator identity when needed.
+Destroying this stack does not establish that stopped resources restarted;
+SSM action reversal/restart behavior has not been verified live.
 (`cdk destroy` with the block *never applied* is the clean case, verified
 by live testing, see `RELEASE.md` item 8. The bootstrap stack, `CDKToolkit`,
 is shared with other CDK projects and stays. It costs ~$0.)
@@ -471,6 +505,44 @@ create/start/invoke actions listed. Anything launched via a
 **service-linked role** runs as a different principal than your user. Any
 identity you didn't list is free. And the root user is never blocked.
 
+## The daily digest
+
+The budget can only react to billing data, which lags real usage by up to
+a day. The digest doesn't wait for billing. Once a day an EventBridge
+schedule runs a second, read-only Lambda that scans the same regions and
+services as the trip report (below) and emails what it finds. Like the
+trip report, it **never stops or changes anything**.
+
+Each digest shows:
+
+- month-to-date spend against your budget, plus AWS's forecast for the month
+- the block's current status, with the approve command if it's waiting on you
+- everything still running or billing, grouped by service and region
+- coverage gaps (regions/services it couldn't check), labeled as such
+
+**When it emails:** set `DAILY_DIGEST=true` for an email every day, including
+empty or incomplete scans. `DAILY_DIGEST=false` (default) removes the schedule
+and digest Lambda. The digest includes every configured stop action, with
+`UNKNOWN` for denied, failed or deadline-skipped lookups. Action success records
+past execution, not the current power state of a resource.
+
+EventBridge delivery failures go to the failure queue, as do exhausted Lambda
+async execution failures. Both retry paths have a two-hour event-age limit;
+the handler also checks the original schedule timestamp before scanning and
+publishing, rejecting missing/invalid or stale timestamps. Inspect the queue
+and logs if email fails; scheduling is best effort, not guaranteed delivery.
+
+
+Unavailable services and regions are listed as coverage gaps in each enabled daily email.
+
+**Left out of the digest on purpose:** plain Lambda functions (free while
+idle, and Radar's own functions always exist, so they'd make every digest
+non-empty) and S3 bucket sizes (the CDK bootstrap bucket always exists).
+Lambda *provisioned concurrency*, which does bill while idle, is included.
+The trip report still covers both.
+
+Change the toggle or hour in `.env`, then `npm run deploy` again.
+
 ## What the report covers and its gaps
 
 The report **describes. It never acts.** Denied or failed scans are labeled
@@ -493,7 +565,9 @@ Near-zero, but **not guaranteed $0.00**:
 | Item | Cost |
 |---|---|
 | The budget + action(s) | Free (first 2 action-enabled budgets per account; the optional stop actions live on the same budget) |
-| Lambda + SNS email | Free tier at this volume, Lambda only runs on a trip |
+
+| Lambda + SNS email | Free tier at this volume. The trip reporter only runs on a trip, the digest once a day (a scan of a minute or so) |
+| EventBridge schedule | Free (scheduled rules have no charge) |
 | CloudWatch Logs | Pennies at most, capped by 30-day retention |
 | CDK bootstrap S3 | A few KB of storage, shared |
 
@@ -525,10 +599,14 @@ or use the CLI commands in Part 4, which are never gated.
    the #1 cause, so click the confirmation email.
 2. Check the **`ReporterFailures` SQS queue** (SQS console → the queue
    containing `ReporterFailures` → *Send and receive messages* → *Poll*).
-   A message there means the reporter ran and failed, and the body says why.
+   A message there can indicate EventBridge delivery failure or Lambda execution failure; inspect its attributes and body.
 3. Check the reporter's **CloudWatch Logs** (Lambda console → the
    `BudgetRadarStack-Reporter…` function → Monitor → Logs) to see whether
    it ran at all.
+
+**No daily digest.** Confirm `DAILY_DIGEST=true`, email subscription confirmation,
+the deployed rule/function, and the failure queue and logs. `false` disables it.
+
 
 **The block keeps re-applying after I lift it.** You pressed Reset (or ran
 `RESET_BUDGET_ACTION`) while month-to-date spend was still over the
@@ -542,3 +620,21 @@ attached. Use the manual detach commands in Part 5, then re-run destroy.
 resolved target, whether *your* current credentials are covered, and
 whether the CDK deploy roles are. Nothing is guessed, and "unknown" is
 printed when it can't be determined.
+
+AWS semantics: [EC2 stop/start](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/Stop_Start.html),
+[API stop protection](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/ec2-stop-protection.html),
+[RDS stopping limits, restart and charges](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/USER_StopInstance.html),
+and [Budgets/SSM managed policy](https://docs.aws.amazon.com/aws-managed-policy/latest/reference/AWSBudgetsActions_RolePolicyForResourceAdministrationWithSSM.html).
+Reversing the IAM deny does not restart resources. Whether reversing a separate
+SSM stop action restarts them remains unverified and requires authorized live
+acceptance testing; use the recovery principal and check current state explicitly.
+Set AWS_REGION and CDK_DEFAULT_REGION consistently (or only one); conflicting
+values are rejected by both preflight and synthesis.
+
+Digest reliability references: [EventBridge delivery DLQ and scoped queue permission](https://docs.aws.amazon.com/eventbridge/latest/userguide/eb-rule-dlq.html)
+and [Lambda asynchronous event age and failure destinations](https://docs.aws.amazon.com/lambda/latest/dg/invocation-async-configuring.html).
+Preflight stop checks require read-only `ec2:DescribeInstances`,
+`ec2:DescribeInstanceAttribute`, `ec2:DescribeInstanceTypes`, and
+`rds:DescribeDBInstances` on the deployment caller; the execution role gains no
+permission to change stop protection. Lifecycle checks reflect deployment time:
+resources or protection settings changed later still require operator attention.

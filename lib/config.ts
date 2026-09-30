@@ -36,6 +36,8 @@ export interface RadarConfig {
   // Opt-in native stop actions (STOP_EC2_INSTANCES / STOP_RDS_INSTANCES).
   // Empty by default: nothing is ever stopped unless listed here.
   stopGroups: StopGroup[];
+  dailyDigest: boolean;
+  dailyDigestHourUtc: number;
 }
 
 // AWS limits for SsmActionDefinition: region pattern, and 1-100 instance IDs.
@@ -179,6 +181,13 @@ export function loadConfig(env: NodeJS.ProcessEnv): RadarConfig {
     return { service, limitUsd };
   });
 
+  // Opt-in: omitted/empty values keep existing deployments schedule-free.
+  const dailyDigest = bool("DAILY_DIGEST", env.DAILY_DIGEST, false);
+  const dailyDigestHourUtc = num("DAILY_DIGEST_HOUR_UTC", (env.DAILY_DIGEST_HOUR_UTC ?? "").trim() || "13", 0, 23);
+  if (!Number.isInteger(dailyDigestHourUtc)) {
+    throw new Error(`DAILY_DIGEST_HOUR_UTC must be a whole hour in [0, 23]. Got: ${env.DAILY_DIGEST_HOUR_UTC}`);
+  }
+
   return {
     alertEmail: email, existingBudgetName, monthlyBudgetUsd, warnAtPercent,
     actionThresholdPercent, actionThresholdType: thresholdType, safety,
@@ -188,6 +197,17 @@ export function loadConfig(env: NodeJS.ProcessEnv): RadarConfig {
     stopGroups: [
       ...parseStopGroups("EC2", env.STOP_EC2_INSTANCES),
       ...parseStopGroups("RDS", env.STOP_RDS_INSTANCES)
-    ]
+    ],
+    dailyDigest, dailyDigestHourUtc
   };
+}
+
+// One region contract shared by synth and preflight. Reject ambiguous targets.
+export function deployRegionFromEnv(env: NodeJS.ProcessEnv): string | undefined {
+  const cdk = env.CDK_DEFAULT_REGION?.trim() || undefined;
+  const aws = env.AWS_REGION?.trim() || undefined;
+  if (cdk && aws && cdk !== aws) {
+    throw new Error(`AWS_REGION (${aws}) conflicts with CDK_DEFAULT_REGION (${cdk}); use one deployment region.`);
+  }
+  return cdk ?? aws;
 }
