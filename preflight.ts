@@ -1,4 +1,6 @@
-import { RadarConfig, loadConfig } from "./lib/config";
+import type { Instance, InstanceAttribute, InstanceTypeInfo } from "@aws-sdk/client-ec2";
+import type { DBInstance } from "@aws-sdk/client-rds";
+import { RadarConfig, loadConfig, deployRegionFromEnv } from "./lib/config";
 
 export interface PreflightResult { ok: boolean; messages: string[]; }
 
@@ -55,6 +57,56 @@ export interface PreflightDeps {
     actions: string[],
     context?: { resourceArnsByAction?: Record<string, string[]> }
   ): Promise<Record<string, RecoveryActionResult> | null>;
+  // Optional (backward-compatible): only consulted when STOP_* is set. If
+  // absent while stop targets are configured, the preflight fails closed.
+  describeEc2Instance?(region: string, id: string): Promise<Ec2StopInfo | null>;
+  describeRdsInstance?(region: string, id: string): Promise<RdsStopInfo | null>;
+  // Optional: the region the AWS SDK resolves from env/profile, used for
+  // bare stop-target IDs when AWS_REGION / CDK_DEFAULT_REGION aren't set
+  // (the CDK CLI resolves the deploy region the same way).
+  resolveDeployRegion?(): Promise<string | undefined>;
+}
+
+// Live lookups for native stop-action targets (STOP_EC2_INSTANCES /
+// STOP_RDS_INSTANCES). Return null only for a genuine "not found".
+export interface Ec2StopInfo {
+  state?: string;            // running | stopped | terminated | ...
+  asgName?: string;          // aws:autoscaling:groupName tag, when an ASG member
+  rootDeviceType?: string;   // ebs | instance-store
+  disableApiStop?: boolean; // Must be explicitly verified false.
+  instanceStorageSupported?: boolean; // Must be explicitly verified false.
+  lifecycle?: string;        // "spot" for Spot Instances
+}
+export interface RdsStopInfo {
+  status?: string;
+  clusterId?: string;        // set for Aurora / Multi-AZ DB cluster members
+  replicaIds?: string[];
+  engine?: string;
+  multiAZ?: boolean;
+  replicaSource?: string;    // set for read replicas
+}
+
+// Keep service response mapping shared with the safety predicates' regression tests.
+export function ec2StopInfo(inst: Instance, protection: InstanceAttribute, type?: InstanceTypeInfo): Ec2StopInfo {
+  return {
+    state: inst.State?.Name,
+    asgName: inst.Tags?.find(t => t.Key === "aws:autoscaling:groupName")?.Value,
+    rootDeviceType: inst.RootDeviceType,
+    lifecycle: inst.InstanceLifecycle,
+    disableApiStop: protection.DisableApiStop?.Value,
+    instanceStorageSupported: type?.InstanceStorageSupported
+  };
+}
+
+export function rdsStopInfo(db: DBInstance): RdsStopInfo {
+  return {
+    status: db.DBInstanceStatus,
+    clusterId: db.DBClusterIdentifier,
+    replicaSource: db.ReadReplicaSourceDBInstanceIdentifier,
+    replicaIds: db.ReadReplicaDBInstanceIdentifiers,
+    engine: db.Engine,
+    multiAZ: db.MultiAZ
+  };
 }
 
 // See the doc comment on simulateRecoveryPermissions above.
@@ -273,6 +325,9 @@ export async function runPreflight(config: RadarConfig, deps: PreflightDeps): Pr
   const info = (m: string) => messages.push(m);
   const warn = (m: string) => messages.push("WARNING: " + m);
 
+  let deployRegion: string | undefined;
+  try { deployRegion = deployRegionFromEnv(process.env); }
+  catch (e: any) { fail(e.message); return { ok, messages }; }
   const caller = await deps.getCallerIdentity();
   info(`Caller: ${caller.Arn} (account ${caller.Account})`);
   const account = caller.Account;
@@ -316,6 +371,9 @@ export async function runPreflight(config: RadarConfig, deps: PreflightDeps): Pr
     "Deploy summary: expect a near-zero, but not exactly $0.00, baseline even at rest (minor storage/request " +
     "charges are normal) — a literal $0.00 bill is not guaranteed and its absence does not indicate a problem."
   );
+  info(config.dailyDigest
+    ? `Deploy summary: DAILY_DIGEST=true emails every day at ${String(config.dailyDigestHourUtc).padStart(2, "0")}:00 UTC.`
+    : "Deploy summary: DAILY_DIGEST=false; daily schedule and digest are disabled.");
 
   // Augmentation 3: reject wildcard / cross-account target forms at preflight
   // too (defense in depth beyond lib/config.ts's own checks).
@@ -468,7 +526,7 @@ export async function runPreflight(config: RadarConfig, deps: PreflightDeps): Pr
   // only knowable here from the environment (AWS_REGION / CDK_DEFAULT_REGION)
   // — preflight makes no live lookup for it — so an unresolvable region
   // (or account) reports "unknown" rather than guessing.
-  const cdkRegion = (process.env.AWS_REGION ?? process.env.CDK_DEFAULT_REGION ?? "").trim();
+  const cdkRegion = deployRegion;
   if (!account || !cdkRegion) {
     info(
       "CDK bootstrap / CloudFormation execution role coverage: unknown (account and/or region not resolvable " +
@@ -748,7 +806,132 @@ export async function runPreflight(config: RadarConfig, deps: PreflightDeps): Pr
     }
   }
 
+  if (config.stopGroups.length > 0) {
+    // Use the same explicit region contract as the CDK app.
+    if (!deployRegion && deps.resolveDeployRegion) {
+      try { deployRegion = (await deps.resolveDeployRegion())?.trim() || undefined; } catch { /* stays unresolved */ }
+    }
+    await checkStopGroups(config, deps, deployRegion, { fail, warn, info });
+  }
+
   return { ok, messages };
+}
+
+type Reporter = { fail(m: string): void; warn(m: string): void; info(m: string): void };
+
+// Native stop actions only work on instances that exist and that a plain
+// Stop can actually stop. AWS doesn't validate the IDs when the action is
+// created, so a typo or an unstoppable instance would otherwise surface as
+// EXECUTION_FAILURE at the exact moment the stop was needed. Fails closed:
+// an instance that can't be verified blocks the deploy, like other targets.
+async function checkStopGroups(
+  config: RadarConfig, deps: PreflightDeps, deployRegion: string | undefined, r: Reporter
+): Promise<void> {
+  const counts = { EC2: 0, RDS: 0 };
+  for (const g of config.stopGroups) counts[g.kind] += g.ids.length;
+  r.info(
+    `Deploy summary: at the action threshold AWS Budgets will also STOP (never terminate) ` +
+    `${counts.EC2} EC2 instance(s) and ${counts.RDS} RDS DB instance(s) ` +
+    `(${config.safety === "armed" ? "automatically" : "after your approval, like the deny"}).`
+  );
+
+  for (const g of config.stopGroups) {
+    const region = g.region ?? deployRegion;
+    const label = g.kind === "EC2" ? "STOP_EC2_INSTANCES" : "STOP_RDS_INSTANCES";
+    if (!region) {
+      r.fail(
+        `${label}: ${g.ids.join(", ")} use the deploy region, but it isn't resolvable here ` +
+        "(set AWS_REGION or CDK_DEFAULT_REGION), so they can't be verified. Prefix them with region: to be explicit."
+      );
+      continue;
+    }
+    if (g.kind === "EC2") await checkEc2(g.ids, region, deps, r);
+    else await checkRds(g.ids, region, deps, r);
+  }
+}
+
+async function checkEc2(ids: string[], region: string, deps: PreflightDeps, r: Reporter): Promise<void> {
+  if (!deps.describeEc2Instance) {
+    r.fail(`STOP_EC2_INSTANCES in ${region}: EC2 lookup unavailable, so ${ids.join(", ")} can't be verified.`);
+    return;
+  }
+  for (const id of ids) {
+    let inst: Ec2StopInfo | null;
+    try {
+      inst = await deps.describeEc2Instance(region, id);
+    } catch (e: any) {
+      r.fail(`STOP_EC2_INSTANCES ${id} (${region}): lookup failed (${e?.name ?? "Error"}: ${e?.message ?? String(e)}); ` +
+        "the preflight caller needs ec2:DescribeInstances, ec2:DescribeInstanceAttribute and ec2:DescribeInstanceTypes.");
+      continue;
+    }
+    const where = `STOP_EC2_INSTANCES ${id} (${region})`;
+    if (!inst) { r.fail(`${where}: no such instance in this account and region.`); continue; }
+    if (inst.state === "terminated" || inst.state === "shutting-down") {
+      r.fail(`${where}: instance is ${inst.state}; remove it from the list.`);
+      continue;
+    }
+    if (inst.asgName) {
+      // AWS: stopping an ASG member is undone by Auto Scaling, which restarts or replaces it.
+      r.fail(`${where}: belongs to Auto Scaling group "${inst.asgName}", which would replace or restart it after a stop. ` +
+        "Scale the group down instead; don't list its instances here.");
+      continue;
+    }
+    if (inst.rootDeviceType === "instance-store") {
+      r.fail(`${where}: instance-store-backed instances can't be stopped (only terminated).`);
+      continue;
+    }
+    if (inst.disableApiStop !== false) {
+      r.fail(`${where}: API stop protection is enabled or unverified; verify DisableApiStop=false yourself. Radar never disables protection.`);
+      continue;
+    }
+    if (inst.instanceStorageSupported !== false) {
+      r.fail(`${where}: instance-store data may be erased on stop, or storage capability is unverified. Use an instance type without instance storage.`);
+      continue;
+    }
+    if (inst.lifecycle === "spot") {
+      r.warn(`${where}: is a Spot Instance; only Spot Instances from a persistent request can be stopped, ` +
+        "so this stop may fail.");
+    }
+    r.info(`${where}: found (${inst.state ?? "state unknown"}), can be stopped.`);
+  }
+}
+
+async function checkRds(ids: string[], region: string, deps: PreflightDeps, r: Reporter): Promise<void> {
+  if (!deps.describeRdsInstance) {
+    r.fail(`STOP_RDS_INSTANCES in ${region}: RDS lookup unavailable, so ${ids.join(", ")} can't be verified.`);
+    return;
+  }
+  for (const id of ids) {
+    let db: RdsStopInfo | null;
+    try {
+      db = await deps.describeRdsInstance(region, id);
+    } catch (e: any) {
+      r.fail(`STOP_RDS_INSTANCES ${id} (${region}): lookup failed (${e?.name ?? "Error"}: ${e?.message ?? String(e)}); ` +
+        "the preflight caller needs rds:DescribeDBInstances.");
+      continue;
+    }
+    const where = `STOP_RDS_INSTANCES ${id} (${region})`;
+    if (!db) { r.fail(`${where}: no such DB instance in this account and region.`); continue; }
+    if (db.clusterId) {
+      r.fail(`${where}: is a member of DB cluster "${db.clusterId}" (e.g. Aurora); cluster members can't be ` +
+        "stopped individually. Stop the cluster yourself instead.");
+      continue;
+    }
+    if (db.replicaSource) {
+      r.fail(`${where}: is a read replica of "${db.replicaSource}"; read replicas can't be stopped.`);
+      continue;
+    }
+    if (db.replicaIds?.length) {
+      r.fail(`${where}: has read replicas; AWS cannot stop a read-replica source.`);
+      continue;
+    }
+    if (db.multiAZ && db.engine?.startsWith("sqlserver")) {
+      r.fail(`${where}: SQL Server Multi-AZ instances cannot be stopped.`);
+      continue;
+    }
+    r.info(`${where}: found (${db.status ?? "status unknown"}), can be stopped. ` +
+      "Note: AWS automatically restarts a stopped DB instance after 7 days.");
+  }
 }
 
 // Runs only when invoked directly (npm run deploy / preflight). Never
@@ -866,6 +1049,43 @@ if (require.main === module) {
         return out;
       }
     };
+
+    if (config.stopGroups.length > 0) {
+      // Loaded only when stop targets are configured. One client per region.
+      const { EC2Client, DescribeInstancesCommand, DescribeInstanceAttributeCommand, DescribeInstanceTypesCommand } = await import("@aws-sdk/client-ec2");
+      const { RDSClient, DescribeDBInstancesCommand } = await import("@aws-sdk/client-rds");
+      const ec2Clients = new Map<string, InstanceType<typeof EC2Client>>();
+      const rdsClients = new Map<string, InstanceType<typeof RDSClient>>();
+      deps.resolveDeployRegion = async () => await sts.config.region();
+      deps.describeEc2Instance = async (region, id) => {
+        if (!ec2Clients.has(region)) ec2Clients.set(region, new EC2Client({ region }));
+        try {
+          const r = await ec2Clients.get(region)!.send(new DescribeInstancesCommand({ InstanceIds: [id] }));
+          const inst = r.Reservations?.[0]?.Instances?.[0];
+          if (!inst) return null;
+          const protection = await ec2Clients.get(region)!.send(new DescribeInstanceAttributeCommand({ InstanceId: id, Attribute: "disableApiStop" }));
+          if (!inst.InstanceType) throw new Error("Instance type is missing; storage safety cannot be verified");
+          const types = await ec2Clients.get(region)!.send(new DescribeInstanceTypesCommand({ InstanceTypes: [inst.InstanceType] }));
+          return ec2StopInfo(inst, protection,
+            types.InstanceTypes?.find(t => t.InstanceType === inst.InstanceType));
+        } catch (e: any) {
+          if (e?.name === "InvalidInstanceID.NotFound" || e?.name === "InvalidInstanceID.Malformed") return null;
+          throw e;
+        }
+      };
+      deps.describeRdsInstance = async (region, id) => {
+        if (!rdsClients.has(region)) rdsClients.set(region, new RDSClient({ region }));
+        try {
+          const r = await rdsClients.get(region)!.send(new DescribeDBInstancesCommand({ DBInstanceIdentifier: id }));
+          const db = r.DBInstances?.[0];
+          if (!db) return null;
+          return rdsStopInfo(db);
+        } catch (e: any) {
+          if (e?.name === "DBInstanceNotFoundFault" || e?.name === "DBInstanceNotFound") return null;
+          throw e;
+        }
+      };
+    }
 
     const result = await runPreflight(config, deps);
     for (const m of result.messages) console.log(m);

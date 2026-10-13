@@ -1,6 +1,11 @@
 export type Safety = "watch" | "armed";
 export type ThresholdType = "ACTUAL" | "FORECASTED";
 export interface ServiceBudget { service: string; limitUsd: number; }
+export type StopKind = "EC2" | "RDS";
+// One group of instances for one native RUN_SSM_DOCUMENTS budget action. AWS
+// runs each such action in exactly one region, so instances are grouped by
+// kind + region. region undefined = the stack's own deploy region.
+export interface StopGroup { kind: StopKind; region?: string; ids: string[]; }
 export interface RadarConfig {
   alertEmail: string;
   existingBudgetName?: string;
@@ -28,6 +33,54 @@ export interface RadarConfig {
   // gross-usage is preserved via a RECORD_TYPE credit/refund exclusion +
   // UnblendedCost metric in the stack).
   excludeServices: string[];
+  // Opt-in native stop actions (STOP_EC2_INSTANCES / STOP_RDS_INSTANCES).
+  // Empty by default: nothing is ever stopped unless listed here.
+  stopGroups: StopGroup[];
+  dailyDigest: boolean;
+  dailyDigestHourUtc: number;
+}
+
+// AWS limits for SsmActionDefinition: region pattern, and 1-100 instance IDs.
+const REGION_RE = /^[a-z]{2,4}-[a-z]+(-[a-z]+)?-\d$/;
+const MAX_IDS_PER_STOP_ACTION = 100;
+const STOP_ID_RE: Record<StopKind, RegExp> = {
+  EC2: /^i-[0-9a-f]{8}([0-9a-f]{9})?$/,
+  // RDS DB instance identifier: letter first, letters/digits/single hyphens,
+  // no trailing hyphen, 1-63 chars. AWS stores it lowercase.
+  RDS: /^[a-z](?!.*--)[a-z0-9-]{0,62}(?<!-)$/
+};
+const STOP_ENV: Record<StopKind, string> = { EC2: "STOP_EC2_INSTANCES", RDS: "STOP_RDS_INSTANCES" };
+
+// Parses "id" (stack region) or "region:id" entries into per-region groups.
+function parseStopGroups(kind: StopKind, raw: string | undefined): StopGroup[] {
+  const envName = STOP_ENV[kind];
+  const groups = new Map<string, StopGroup>();
+  for (const entry of list(raw)) {
+    const idx = entry.indexOf(":");
+    const region = idx >= 0 ? entry.slice(0, idx).trim() : undefined;
+    let id = (idx >= 0 ? entry.slice(idx + 1) : entry).trim();
+    if (kind === "RDS") id = id.toLowerCase();
+    if (region !== undefined && !REGION_RE.test(region)) {
+      throw new Error(`${envName} entry has an invalid region "${region}" (expected e.g. us-east-1:<id>). Got: ${entry}`);
+    }
+    if (!STOP_ID_RE[kind].test(id)) {
+      const what = kind === "EC2" ? "an EC2 instance ID like i-0123456789abcdef0" : "an RDS DB instance identifier";
+      throw new Error(`${envName} entry must be ${what}, optionally prefixed "region:". Got: ${entry}`);
+    }
+    const key = region ?? "";
+    const group = groups.get(key) ?? { kind, region, ids: [] };
+    if (!group.ids.includes(id)) group.ids.push(id);
+    groups.set(key, group);
+  }
+  for (const g of groups.values()) {
+    if (g.ids.length > MAX_IDS_PER_STOP_ACTION) {
+      throw new Error(
+        `${envName} lists ${g.ids.length} instances in ${g.region ?? "the deploy region"}; ` +
+        `AWS allows at most ${MAX_IDS_PER_STOP_ACTION} per region.`
+      );
+    }
+  }
+  return [...groups.values()];
 }
 
 function list(v?: string): string[] {
@@ -128,11 +181,33 @@ export function loadConfig(env: NodeJS.ProcessEnv): RadarConfig {
     return { service, limitUsd };
   });
 
+  // Opt-in: omitted/empty values keep existing deployments schedule-free.
+  const dailyDigest = bool("DAILY_DIGEST", env.DAILY_DIGEST, false);
+  const dailyDigestHourUtc = num("DAILY_DIGEST_HOUR_UTC", (env.DAILY_DIGEST_HOUR_UTC ?? "").trim() || "13", 0, 23);
+  if (!Number.isInteger(dailyDigestHourUtc)) {
+    throw new Error(`DAILY_DIGEST_HOUR_UTC must be a whole hour in [0, 23]. Got: ${env.DAILY_DIGEST_HOUR_UTC}`);
+  }
+
   return {
     alertEmail: email, existingBudgetName, monthlyBudgetUsd, warnAtPercent,
     actionThresholdPercent, actionThresholdType: thresholdType, safety,
     denyTargetUsers: users, denyTargetGroups: groups, denyTargetRoles: roles,
     recoveryPrincipalArn: recovery, serviceBudgets, trackGrossUsage,
-    excludeServices: list(env.EXCLUDE_SERVICES)
+    excludeServices: list(env.EXCLUDE_SERVICES),
+    stopGroups: [
+      ...parseStopGroups("EC2", env.STOP_EC2_INSTANCES),
+      ...parseStopGroups("RDS", env.STOP_RDS_INSTANCES)
+    ],
+    dailyDigest, dailyDigestHourUtc
   };
+}
+
+// One region contract shared by synth and preflight. Reject ambiguous targets.
+export function deployRegionFromEnv(env: NodeJS.ProcessEnv): string | undefined {
+  const cdk = env.CDK_DEFAULT_REGION?.trim() || undefined;
+  const aws = env.AWS_REGION?.trim() || undefined;
+  if (cdk && aws && cdk !== aws) {
+    throw new Error(`AWS_REGION (${aws}) conflicts with CDK_DEFAULT_REGION (${cdk}); use one deployment region.`);
+  }
+  return cdk ?? aws;
 }

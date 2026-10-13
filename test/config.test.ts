@@ -124,3 +124,83 @@ test("parses SERVICE_BUDGETS list", () => {
     { service: "Amazon SageMaker", limitUsd: 10 }
   ]);
 });
+
+// --- Native stop actions (STOP_EC2_INSTANCES / STOP_RDS_INSTANCES) ---
+
+test("no STOP_* configured means no stop groups (nothing is ever stopped by default)", () => {
+  expect(loadConfig({ ...base } as any).stopGroups).toEqual([]);
+});
+
+test("bare IDs go to the deploy region; region:id entries are grouped per region; duplicates dropped", () => {
+  const c = loadConfig({
+    ...base,
+    STOP_EC2_INSTANCES: "i-0123456789abcdef0, us-west-2:i-0fedcba9876543210, i-0123456789abcdef0, i-12345678",
+    STOP_RDS_INSTANCES: "LabDB, eu-west-1:other-db"
+  } as any);
+  expect(c.stopGroups).toEqual([
+    { kind: "EC2", region: undefined, ids: ["i-0123456789abcdef0", "i-12345678"] },
+    { kind: "EC2", region: "us-west-2", ids: ["i-0fedcba9876543210"] },
+    { kind: "RDS", region: undefined, ids: ["labdb"] },            // RDS identifiers are lowercased
+    { kind: "RDS", region: "eu-west-1", ids: ["other-db"] }
+  ]);
+});
+
+test.each([
+  ["STOP_EC2_INSTANCES", "i-xyz", /EC2 instance ID/],
+  ["STOP_EC2_INSTANCES", "ami-0123456789abcdef0", /EC2 instance ID/],
+  ["STOP_EC2_INSTANCES", "useast1:i-0123456789abcdef0", /invalid region/],
+  ["STOP_RDS_INSTANCES", "1db", /RDS DB instance identifier/],
+  ["STOP_RDS_INSTANCES", "db-", /RDS DB instance identifier/],
+  ["STOP_RDS_INSTANCES", "my--db", /RDS DB instance identifier/],
+  ["STOP_RDS_INSTANCES", "arn:aws:rds:us-east-1:111122223333:db:x", /invalid region/]
+])("rejects %s=%s", (name, value, err) => {
+  expect(() => loadConfig({ ...base, [name]: value } as any)).toThrow(err);
+});
+
+test("rejects more than 100 instances in one region (AWS limit per stop action)", () => {
+  const ids = Array.from({ length: 101 }, (_, i) => `i-${i.toString(16).padStart(8, "0")}`).join(",");
+  expect(() => loadConfig({ ...base, STOP_EC2_INSTANCES: ids } as any)).toThrow(/at most 100/);
+
+});
+
+// --- Daily digest ---
+
+test("daily digest defaults to disabled at 13:00 UTC", () => {
+  const c = loadConfig({ ...base } as any);
+  expect(c.dailyDigest).toBe(false);
+  expect(c.dailyDigestHourUtc).toBe(13);
+});
+
+test("empty DAILY_DIGEST / DAILY_DIGEST_HOUR_UTC fall back to the defaults", () => {
+  const c = loadConfig({ ...base, DAILY_DIGEST: " ", DAILY_DIGEST_HOUR_UTC: "" } as any);
+  expect(c.dailyDigest).toBe(false);
+  expect(c.dailyDigestHourUtc).toBe(13);
+});
+
+test.each(["true", "false"])("accepts DAILY_DIGEST=%s", mode => {
+  expect(loadConfig({ ...base, DAILY_DIGEST: mode } as any).dailyDigest).toBe(mode === "true");
+});
+
+test("rejects an unknown DAILY_DIGEST mode", () => {
+  expect(() => loadConfig({ ...base, DAILY_DIGEST: "weekly" } as any)).toThrow(/DAILY_DIGEST/);
+});
+
+test("accepts DAILY_DIGEST_HOUR_UTC at both ends of the day", () => {
+  expect(loadConfig({ ...base, DAILY_DIGEST_HOUR_UTC: "0" } as any).dailyDigestHourUtc).toBe(0);
+  expect(loadConfig({ ...base, DAILY_DIGEST_HOUR_UTC: "23" } as any).dailyDigestHourUtc).toBe(23);
+});
+
+test.each(["24", "-1", "9.5", "nine"])("rejects DAILY_DIGEST_HOUR_UTC=%s", hour => {
+  expect(() => loadConfig({ ...base, DAILY_DIGEST_HOUR_UTC: hour } as any)).toThrow(/DAILY_DIGEST_HOUR_UTC/);
+});
+
+test.each(["findings", "always", "off", "1"])("rejects legacy DAILY_DIGEST=%s explicitly", value => {
+  expect(() => loadConfig({ ...base, DAILY_DIGEST: value } as any)).toThrow(/DAILY_DIGEST must be "true" or "false"/);
+});
+
+test("synth and preflight share explicit deployment region resolution", () => {
+  const { deployRegionFromEnv } = require("../lib/config");
+  expect(deployRegionFromEnv({ AWS_REGION: "us-east-1" })).toBe("us-east-1");
+  expect(deployRegionFromEnv({ CDK_DEFAULT_REGION: "us-west-2" })).toBe("us-west-2");
+  expect(() => deployRegionFromEnv({ AWS_REGION: "us-east-1", CDK_DEFAULT_REGION: "us-west-2" })).toThrow(/conflicts/);
+});

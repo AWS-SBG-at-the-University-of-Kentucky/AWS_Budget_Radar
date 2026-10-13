@@ -1,7 +1,7 @@
 {
   "name": "aws-budget-radar",
   "version": "0.1.0",
-  "description": "Clone-and-deploy AWS CDK safeguard for personal learning accounts: when a cost budget is breached, it blocks selected creation/start operations by your configured IAM identities and emails a region-wide inventory of what's running. Read-only reporter; never stops or deletes resources; not a hard cap.",
+  "description": "Clone-and-deploy AWS CDK safeguard for personal learning accounts: when a cost budget is breached, it blocks selected creation/start operations by your configured IAM identities and emails a region-wide inventory of what's running. Read-only reporter; optionally stops (never deletes) EC2/RDS instances you list, via native budget actions; not a hard cap.",
   "repository": {
     "type": "git",
     "url": "https://github.com/AWS-SBG-at-the-University-of-Kentucky/AWS_Budget_Radar.git"
@@ -29,7 +29,9 @@
   },
   "dependencies": {
     "@aws-sdk/client-budgets": "^3.600.0",
+    "@aws-sdk/client-ec2": "^3.1142.0",
     "@aws-sdk/client-iam": "^3.600.0",
+    "@aws-sdk/client-rds": "^3.1142.0",
     "@aws-sdk/client-sns": "^3.1133.0",
     "@aws-sdk/client-sts": "^3.600.0",
     "aws-cdk-lib": "^2.160.0",
