@@ -500,6 +500,10 @@ h1 {
   <h1>Can't reach the setup server</h1>
   <p>This page is served by <code>npm run dev</code>. Start it again in your terminal, then reload.</p>
 </div>
+<div class="fatal" id="locked" hidden>
+  <h1>Open the link from your terminal</h1>
+  <p>For your safety, this page only works through the private link that setup prints in your terminal. It changes every time setup starts, so copy the latest one into your browser.</p>
+</div>
 
 <script>
 "use strict";
@@ -535,17 +539,31 @@ function fill(el, ...kids) {
 }
 const $ = (id) => document.getElementById(id);
 
+// The server answers only requests carrying this launch's token. It comes
+// in the link's #fragment (browsers never send that part to a server); it's
+// then taken out of the address bar and kept for reloads of this tab.
+const TOKEN = (() => {
+  const fromLink = new URLSearchParams(location.hash.slice(1)).get("token");
+  if (fromLink) {
+    history.replaceState(null, "", location.pathname + location.search);
+    try { sessionStorage.setItem("token", fromLink); } catch {}
+    return fromLink;
+  }
+  try { return sessionStorage.getItem("token") || ""; } catch { return ""; }
+})();
+
 async function api(path, body) {
+  const headers = { Authorization: `Bearer ${TOKEN}` };
   let res;
   try {
-    res = await fetch(path, body === undefined ? {} : {
-      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body)
+    res = await fetch(path, body === undefined ? { headers } : {
+      method: "POST", headers: { ...headers, "Content-Type": "application/json" }, body: JSON.stringify(body)
     });
   } catch {
     throw new Error("Can't reach the setup server. Is npm run dev still running?");
   }
   const data = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(data.error || `Request failed (${res.status})`);
+  if (!res.ok) throw Object.assign(new Error(data.error || `Request failed (${res.status})`), { status: res.status });
   return data;
 }
 
@@ -1009,8 +1027,8 @@ function paintSuggestions() {
   let st;
   try {
     st = await api("/api/state");
-  } catch {
-    $("fatal").hidden = false;
+  } catch (e) {
+    $(e.status === 401 ? "locked" : "fatal").hidden = false;
     return;
   }
   Object.assign(S, {

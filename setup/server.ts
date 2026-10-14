@@ -3,6 +3,7 @@ import * as http from "http";
 import * as path from "path";
 import { AddressInfo } from "net";
 import { spawn } from "child_process";
+import { randomBytes, timingSafeEqual } from "crypto";
 import { parse } from "dotenv";
 import { loadConfig } from "../lib/config";
 import { templateDefaults, renderEnv } from "./envfile";
@@ -16,6 +17,7 @@ import { SetupAws, checkSignIns, localAws } from "./aws";
 export interface SetupServerOptions {
   root: string; // folder holding .env.example and .env
   aws: SetupAws;
+  token: string; // new random secret each launch; every API call must send it
   pagePath?: string;
 }
 
@@ -38,6 +40,11 @@ export function createSetupServer(opts: SetupServerOptions): http.Server {
   const envPath = path.join(opts.root, ".env");
   const pagePath = opts.pagePath ?? path.join(__dirname, "index.html");
   const docsUrl = repoDocsUrl(opts.root);
+  const expectedAuth = Buffer.from(`Bearer ${opts.token}`);
+  const authorized = (header = "") => {
+    const got = Buffer.from(header);
+    return got.length === expectedAuth.length && timingSafeEqual(got, expectedAuth);
+  };
 
   const readTemplate = () => fs.readFileSync(templatePath, "utf8");
   const readEnv = (): Values | undefined => (fs.existsSync(envPath) ? parse(fs.readFileSync(envPath)) : undefined);
@@ -95,11 +102,7 @@ export function createSetupServer(opts: SetupServerOptions): http.Server {
     } catch (e: any) {
       throw new HttpError(400, e.message);
     }
-    // Write-then-rename so a crash can't leave a half-written .env. The temp
-    // name matches .gitignore's `.env.*.local`.
-    const tmp = path.join(opts.root, ".env.saving.local");
-    fs.writeFileSync(tmp, text);
-    fs.renameSync(tmp, envPath);
+    writePrivateFile(envPath, text);
     return { saved: true, envFile: { exists: true, path: envPath }, validation: validate(values) };
   }
 
@@ -117,6 +120,12 @@ export function createSetupServer(opts: SetupServerOptions): http.Server {
       if (url.pathname.startsWith("/api/")) {
         const site = req.headers["sec-fetch-site"];
         if (site && site !== "same-origin" && site !== "none") throw new HttpError(403, "Cross-site request blocked.");
+        // The checks above stop other websites, but any program on this
+        // computer (another user's too) can reach 127.0.0.1 and send any
+        // headers it likes. Only the person who started setup has the token.
+        if (!authorized(req.headers.authorization)) {
+          throw new HttpError(401, "This page needs its private link. Open the link printed in the terminal where setup is running.");
+        }
       }
       if (req.method === "POST") {
         // JSON forces a CORS preflight (which this server never approves),
@@ -179,6 +188,23 @@ function submittedValues(body: any): Values {
   return out;
 }
 
+// Write-then-rename so a crash can't leave a half-written .env. The rename
+// swaps in the temp file's permissions too, so the temp file is owner-only
+// (0600) from the moment it exists: .env may hold settings other users on
+// the machine shouldn't read. "wx" means a brand-new file, never an existing
+// file or symlink. The temp name matches .gitignore's `.env.*.local`.
+function writePrivateFile(dest: string, text: string) {
+  const tmp = path.join(path.dirname(dest), `.env.saving-${randomBytes(6).toString("hex")}.local`);
+  const fd = fs.openSync(tmp, "wx", 0o600);
+  try {
+    try { fs.writeFileSync(fd, text); } finally { fs.closeSync(fd); }
+    fs.renameSync(tmp, dest);
+  } catch (e) {
+    fs.rmSync(tmp, { force: true });
+    throw e;
+  }
+}
+
 function readJson(req: http.IncomingMessage): Promise<unknown> {
   return new Promise((resolve, reject) => {
     let size = 0;
@@ -239,12 +265,31 @@ function listenFrom(server: http.Server, port: number, tries: number): Promise<n
   });
 }
 
-// Best effort: the URL is always printed too (e.g. for WSL or SSH).
-function openBrowser(url: string) {
+// Best effort: the URL is always printed too (e.g. for WSL or SSH). The URL
+// holds the token, and other users can see this computer's command lines
+// (ps, /proc), so the browser is handed an owner-only file that redirects to
+// it instead. The file goes in the project folder because sandboxed browsers
+// (e.g. Ubuntu's snap Firefox) can't read /tmp; it's removed on exit.
+function openBrowser(url: string, root: string) {
+  const file = path.join(root, `.setup-open-${randomBytes(6).toString("hex")}.html`);
+  try {
+    fs.writeFileSync(file,
+      `<!doctype html><meta charset="utf-8"><meta http-equiv="refresh" content="0;url=${url}">` +
+      `<title>AWS Budget Radar setup</title><a href="${url}">Open the AWS Budget Radar setup page</a>`,
+      { flag: "wx", mode: 0o600 });
+  } catch {
+    return;
+  }
+  const remove = () => fs.rmSync(file, { force: true });
+  process.once("exit", remove);
+  // Ctrl+C: remove it, then let the signal end the process as it always did.
+  for (const sig of ["SIGINT", "SIGTERM"] as const) {
+    process.once(sig, () => { remove(); process.kill(process.pid, sig); });
+  }
   const [cmd, args] =
-    process.platform === "darwin" ? ["open", [url]] :
-    process.platform === "win32" ? ["cmd", ["/c", "start", "", url]] :
-    ["xdg-open", [url]];
+    process.platform === "darwin" ? ["open", [file]] :
+    process.platform === "win32" ? ["cmd", ["/c", "start", "", file]] :
+    ["xdg-open", [file]];
   const child = spawn(cmd as string, args as string[], { stdio: "ignore", detached: true });
   child.on("error", () => {});
   child.unref();
@@ -257,20 +302,23 @@ if (require.main === module) {
       console.error(`Can't find .env.example in ${root}. Run this from the AWS_Budget_Radar folder.`);
       process.exit(1);
     }
-    const server = createSetupServer({ root, aws: localAws });
+    // New every launch, so links from earlier runs stop working.
+    const token = randomBytes(32).toString("base64url");
+    const server = createSetupServer({ root, aws: localAws, token });
     const port = await listenFrom(server, Number(process.env.PORT) || 4000, 20);
-    const url = `http://127.0.0.1:${port}`;
+    const url = `http://127.0.0.1:${port}/#token=${token}`;
     console.log([
       "",
       "  AWS Budget Radar setup is running:",
       "",
       `    ➜  ${url}`,
       "",
+      "  The link has a private key, new each time, so only you can use the page.",
       "  Fill in the form and click Save. It writes your .env file for you.",
       "  Press Ctrl+C here when you're done.",
       ""
     ].join("\n"));
-    if (process.env.BROWSER !== "none" && !process.argv.includes("--no-open")) openBrowser(url);
+    if (process.env.BROWSER !== "none" && !process.argv.includes("--no-open")) openBrowser(url, root);
   })().catch(e => {
     console.error(`Setup page failed to start: ${e?.message ?? e}`);
     process.exit(1);

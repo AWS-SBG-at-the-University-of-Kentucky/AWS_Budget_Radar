@@ -8,6 +8,7 @@ import { createSetupServer } from "../setup/server";
 import { WhoAmI, AwsProfile } from "../setup/aws";
 
 const REPO = path.join(__dirname, "..");
+const TOKEN = "this-launchs-token-0123456789abcdefghijk";
 const VALID = {
   ALERT_EMAIL: "student@example.edu",
   IAM_DENY_TARGET_USERS: "learning",
@@ -31,6 +32,7 @@ beforeEach(async () => {
   probeEnv = undefined;
   server = createSetupServer({
     root,
+    token: TOKEN,
     pagePath: path.join(REPO, "setup", "index.html"),
     aws: {
       profiles: () => PROFILES,
@@ -56,13 +58,15 @@ afterEach(async () => {
 
 interface Res { status: number; headers: http.IncomingHttpHeaders; body: any; }
 
-function request(method: string, urlPath: string, opts: { body?: unknown; headers?: Record<string, string> } = {}): Promise<Res> {
+// Sends what the page sends; a header set to undefined is left out.
+function request(method: string, urlPath: string, opts: { body?: unknown; headers?: Record<string, string | undefined> } = {}): Promise<Res> {
   const payload = opts.body === undefined ? undefined : JSON.stringify(opts.body);
-  const headers: Record<string, string> = {
+  const headers = Object.fromEntries(Object.entries({
     host: `127.0.0.1:${port}`,
+    authorization: `Bearer ${TOKEN}`,
     ...(payload ? { "content-type": "application/json", origin: `http://127.0.0.1:${port}` } : {}),
     ...opts.headers
-  };
+  }).filter(([, v]) => v !== undefined)) as Record<string, string>;
   return new Promise((resolve, reject) => {
     const req = http.request({ host: "127.0.0.1", port, method, path: urlPath, headers }, res => {
       let data = "";
@@ -162,11 +166,55 @@ describe("POST /api/save", () => {
     const raw = await new Promise<number>((resolve) => {
       const req = http.request({
         host: "127.0.0.1", port, method: "POST", path: "/api/save",
-        headers: { host: `127.0.0.1:${port}`, "content-type": "application/json" }
+        headers: { host: `127.0.0.1:${port}`, "content-type": "application/json", authorization: `Bearer ${TOKEN}` }
       }, res => { res.resume(); resolve(res.statusCode!); });
       req.end("{not json");
     });
     expect(raw).toBe(400);
+  });
+});
+
+// POSIX modes only: Windows files have just a read-only bit.
+(process.platform === "win32" ? describe.skip : describe)("POST /api/save keeps .env private", () => {
+  const realFs: typeof fs = require("fs"); // the module server.ts calls, so spies reach it
+  const modeOf = (p: string) => fs.statSync(p).mode & 0o777;
+  let oldUmask: number;
+  // 022 is the common default: a plain new file comes out 0644, readable by everyone.
+  beforeEach(() => { oldUmask = process.umask(0o022); });
+  afterEach(() => { process.umask(oldUmask); jest.restoreAllMocks(); });
+
+  test("saving over an owner-only .env keeps it owner-only, kept settings included", async () => {
+    fs.writeFileSync(envFile(), "AWS_PROFILE=admin\nMY_TOKEN=not-for-others\n", { mode: 0o600 });
+    const r = await request("POST", "/api/save", { body: { values: VALID } });
+    expect(r.status).toBe(200);
+    expect(modeOf(envFile())).toBe(0o600);
+    expect(parse(fs.readFileSync(envFile(), "utf8"))).toMatchObject({ AWS_PROFILE: "admin", MY_TOKEN: "not-for-others" });
+  });
+
+  test("a new .env, or one others could read, is saved owner-only", async () => {
+    await request("POST", "/api/save", { body: { values: VALID } });
+    expect(modeOf(envFile())).toBe(0o600);
+    fs.chmodSync(envFile(), 0o644);
+    await request("POST", "/api/save", { body: { values: VALID } });
+    expect(modeOf(envFile())).toBe(0o600);
+    expect(fs.readdirSync(root).sort()).toEqual([".env", ".env.example"]); // no temp file left
+  });
+
+  test("the temp file is owner-only and gitignored, and a failed save removes it and leaves .env alone", async () => {
+    fs.writeFileSync(envFile(), "ALERT_EMAIL=keep@example.edu\n", { mode: 0o600 });
+    let tmp = "";
+    let tmpMode = 0;
+    jest.spyOn(realFs, "renameSync").mockImplementationOnce(from => {
+      tmp = String(from);
+      tmpMode = modeOf(tmp);
+      throw new Error("disk full");
+    });
+    const r = await request("POST", "/api/save", { body: { values: VALID } });
+    expect(r.status).toBe(500);
+    expect(tmpMode).toBe(0o600);
+    expect(path.basename(tmp)).toMatch(/^\.env\..+\.local$/); // .gitignore's `.env.*.local`
+    expect(fs.existsSync(tmp)).toBe(false);
+    expect(fs.readFileSync(envFile(), "utf8")).toBe("ALERT_EMAIL=keep@example.edu\n");
   });
 });
 
@@ -246,6 +294,46 @@ describe("localhost safety", () => {
     const r = await request("GET", "/api/aws/whoami", { headers: { "sec-fetch-site": "cross-site" } });
     expect(r.status).toBe(403);
     expect(whoamiEnv).toBeUndefined();
+  });
+
+  // Any program on this computer (another user's, say) can reach 127.0.0.1,
+  // send the right Host and leave out the browser headers. Only the
+  // per-launch token sets the person who started setup apart.
+  const API: [string, string][] = [
+    ["GET", "/api/state"], ["POST", "/api/validate"], ["POST", "/api/save"],
+    ["GET", "/api/aws/signins"], ["GET", "/api/aws/whoami?profile=student-sso"]
+  ];
+  test.each([
+    ["no token", undefined],
+    ["a wrong token", "Bearer wrong"],
+    ["a same-length token from another launch", `Bearer ${"x".repeat(TOKEN.length)}`],
+    ["the token without Bearer", TOKEN]
+  ])("every API route refuses %s, and nothing is written or looked up", async (_label, authorization) => {
+    for (const [method, p] of API) {
+      const r = await request(method, p, {
+        body: method === "POST" ? { values: VALID } : undefined,
+        headers: { authorization, origin: undefined }
+      });
+      expect([p, r.status]).toEqual([p, 401]);
+      expect(r.body.error).toMatch(/link printed in the terminal/);
+    }
+    expect(fs.existsSync(envFile())).toBe(false);
+    expect(probeEnv).toBeUndefined();
+    expect(whoamiEnv).toBeUndefined();
+  });
+
+  test("with the token, a client without browser headers is served", async () => {
+    const r = await request("POST", "/api/save", { body: { values: VALID }, headers: { origin: undefined } });
+    expect(r.status).toBe(200);
+    expect(fs.existsSync(envFile())).toBe(true);
+  });
+
+  test("the page loads without the token, and no response ever contains it", async () => {
+    const page = await request("GET", "/", { headers: { authorization: undefined } });
+    expect(page.status).toBe(200);
+    const responses = [page, ...await Promise.all(API.map(([method, p]) =>
+      request(method, p, { body: method === "POST" ? { values: VALID } : undefined })))];
+    for (const r of responses) expect(JSON.stringify([r.headers, r.body])).not.toContain(TOKEN);
   });
 
   test("unknown paths are 404, and nothing else in the folder is served", async () => {
