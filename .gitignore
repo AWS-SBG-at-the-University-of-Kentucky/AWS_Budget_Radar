@@ -19,5 +19,6 @@ tasks/
 *.log
 .env.local
 .env.*.local
+.setup-open-*.html
 .claude/*
 .omni/*

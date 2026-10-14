@@ -140,6 +140,11 @@ starts the page. `npm run dev` starts just the page.
 - It listens only on `127.0.0.1`, so nothing else on your network can reach
   it. If port 4000 is busy it uses the next free port and prints the address.
   `BROWSER=none npm run dev` skips opening a browser.
+- The printed link ends in `#token=…`, a private key that's new every time
+  the page starts. The page refuses any request without it: other people
+  signed in to the same computer can reach `127.0.0.1` too, and the key is
+  what stops them reading or changing your settings. After a restart, an old
+  tab asks you to open the new link.
 - Saving keeps the comments from `.env.example` and any extra settings you
   added to `.env` yourself (such as `AWS_PROFILE`). You can save a half-filled
   form and come back later.

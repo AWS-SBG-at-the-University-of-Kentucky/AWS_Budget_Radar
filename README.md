@@ -72,7 +72,7 @@ npm run setup
 
 `npm run setup` checks your Node version, installs dependencies, creates your
 `.env` config file (it never overwrites one you already have), and opens the
-setup page at `http://127.0.0.1:4000`.
+setup page in your browser. If it doesn't open, copy the private link it prints.
 
 ![The setup page: each question writes one line of your .env file](docs/images/setup-page-form.webp)
 
