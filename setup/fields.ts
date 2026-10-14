@@ -22,8 +22,8 @@ export interface Field {
   // The .env.example value is an illustration (e.g. "your-iam-username"),
   // not a usable default, so the page shows it as empty until filled in.
   exampleOnly?: boolean;
-  // README heading anchor for a "Learn more" link.
-  readme?: string;
+  // "Learn more" link: a repo doc and heading anchor, e.g. "README.md#4-deploy".
+  docs?: string;
   // Only matters while this toggle is on (the page dims it otherwise).
   dependsOn?: string;
 }
@@ -55,7 +55,7 @@ export const FIELDS: Field[] = [
     key: "ALERT_EMAIL", section: "alerts", type: "email", required: true,
     label: "Alert email",
     help: "Alerts and the \"what's still running\" report go here. After you deploy, AWS emails this address a confirmation link: click it, or no alerts arrive.",
-    placeholder: "you@example.com", readme: "32-confirm-your-email-dont-skip-this"
+    placeholder: "you@example.com", docs: "README.md#4-deploy"
   },
   {
     key: "MONTHLY_BUDGET_USD", section: "budget", type: "money", required: true,
@@ -67,13 +67,13 @@ export const FIELDS: Field[] = [
     key: "IAM_DENY_TARGET_USERS", section: "block", type: "list", required: true, exampleOnly: true,
     label: "IAM user(s) to block",
     help: "Your everyday IAM user, e.g. learning. Root and SSO sign-ins can't be blocked, so if you work as one of those, create an IAM user first. Separate several with commas.",
-    placeholder: "learning", readme: "11-create-your-learning-iam-user-required"
+    placeholder: "learning", docs: "README.md#1-create-a-learning-iam-user"
   },
   {
     key: "RECOVERY_PRINCIPAL_ARN", section: "recovery", type: "arn", required: true, exampleOnly: true,
     label: "Recovery admin ARN",
     help: "The full ARN of your separate admin user or role. It must not be one of the identities blocked above.",
-    placeholder: "arn:aws:iam::123456789012:role/YourAdminRole", readme: "11-create-your-learning-iam-user-required"
+    placeholder: "arn:aws:iam::123456789012:role/YourAdminRole", docs: "README.md#1-create-a-learning-iam-user"
   },
   {
     key: "SAFETY", section: "safety", type: "choice", required: true,
@@ -83,13 +83,13 @@ export const FIELDS: Field[] = [
       { value: "watch", label: "Watch (start here)", help: "You get an email and the block waits for your approval. Nothing is blocked until you say so." },
       { value: "armed", label: "Armed", help: "The block applies automatically the moment the budget trips. The email is an after-action report." }
     ],
-    readme: "45-switching-between-watch-and-armed"
+    docs: "docs/reference.md#watch-vs-armed"
   },
   {
     key: "DAILY_DIGEST", section: "digest", type: "toggle",
     label: "Email me a daily \"what's still running\" digest",
     help: "A live, read-only scan of every region, sent once a day even on quiet days. Billing data lags up to a day, so this can catch a forgotten notebook first.",
-    readme: "the-daily-digest"
+    docs: "docs/reference.md#the-daily-digest"
   },
   {
     key: "DAILY_DIGEST_HOUR_UTC", section: "digest", type: "hour",
@@ -152,13 +152,13 @@ export const FIELDS: Field[] = [
     key: "STOP_EC2_INSTANCES", section: "stop", type: "list",
     label: "EC2 instances to stop",
     help: "Instance IDs AWS should stop (never terminate) when the block fires. For another region, prefix it, e.g. us-west-2:i-0123456789abcdef0. Not for Auto Scaling or instance-store instances.",
-    placeholder: "i-0123456789abcdef0", readme: "46-optional-stop-specific-instances-too"
+    placeholder: "i-0123456789abcdef0", docs: "docs/reference.md#stopping-specific-instances"
   },
   {
     key: "STOP_RDS_INSTANCES", section: "stop", type: "list",
     label: "RDS databases to stop",
     help: "DB instance identifiers to stop when the block fires. Not for Aurora or read replicas. AWS restarts a stopped database after 7 days.",
-    placeholder: "practice-db", readme: "46-optional-stop-specific-instances-too"
+    placeholder: "practice-db", docs: "docs/reference.md#stopping-specific-instances"
   }
 ];
 

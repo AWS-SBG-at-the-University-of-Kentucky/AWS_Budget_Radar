@@ -51,12 +51,16 @@ test("every choice option is a value loadConfig accepts", () => {
   }
 });
 
-test("every README link points at a real README heading (GitHub anchor rules)", () => {
-  const readme = fs.readFileSync(path.join(__dirname, "..", "README.md"), "utf8");
-  const anchors = readme.split("\n")
+test("every \"Learn more\" link points at a real heading in a real doc (GitHub anchor rules)", () => {
+  const anchorsIn = (file: string) => fs.readFileSync(path.join(__dirname, "..", file), "utf8").split("\n")
     .filter(l => /^#{1,6} /.test(l))
     .map(l => l.replace(/^#+ /, "").toLowerCase().replace(/[^\w\- ]/g, "").replace(/ /g, "-"));
-  for (const f of FIELDS.filter(f => f.readme)) expect(anchors).toContain(f.readme);
+  const linked = FIELDS.filter(f => f.docs);
+  expect(linked.length).toBeGreaterThan(0);
+  for (const f of linked) {
+    const [file, anchor] = f.docs!.split("#");
+    expect(anchorsIn(file)).toContain(anchor);
+  }
 });
 
 test("exampleOnly fields really have an example value in .env.example to blank out", () => {

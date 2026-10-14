@@ -507,7 +507,7 @@ h1 {
 const S = {
   sections: [], fields: [], byKey: {}, values: {},
   touched: new Set(), savedOnce: false, dirty: false,
-  validation: null, whoami: null, readmeUrl: null, envFile: null, extras: [],
+  validation: null, whoami: null, docsUrl: null, envFile: null, extras: [],
   validateSeq: 0, validateTimer: null
 };
 
@@ -549,9 +549,9 @@ async function api(path, body) {
   return data;
 }
 
-function learnMore(anchor) {
-  if (!anchor || !S.readmeUrl || !/^https:\/\//.test(S.readmeUrl)) return null;
-  return h("a", { href: `${S.readmeUrl}#${anchor}`, target: "_blank", rel: "noopener noreferrer" }, "Learn more ↗");
+function learnMore(doc) {
+  if (!doc || !S.docsUrl || !/^https:\/\//.test(S.docsUrl)) return null;
+  return h("a", { href: S.docsUrl + doc, target: "_blank", rel: "noopener noreferrer" }, "Learn more ↗");
 }
 
 // ---------- rendering ----------
@@ -601,7 +601,7 @@ function fieldBlock(f) {
   return h("div", { class: "field", id: `fld-${f.key}`, "data-key": f.key },
     label,
     control(f),
-    h("p", { class: "help", id: `h-${f.key}` }, f.help, " ", learnMore(f.readme)),
+    h("p", { class: "help", id: `h-${f.key}` }, f.help, " ", learnMore(f.docs)),
     h("p", { class: "err", id: `e-${f.key}`, hidden: true }),
     h("p", { class: "writes" }, h("span", { text: ".env" }), h("code", { id: `w-${f.key}` }))
   );
@@ -1014,7 +1014,7 @@ function paintSuggestions() {
     return;
   }
   Object.assign(S, {
-    sections: st.sections, fields: st.fields, readmeUrl: st.readmeUrl,
+    sections: st.sections, fields: st.fields, docsUrl: st.docsUrl,
     envFile: st.envFile, extras: st.extras, validation: st.validation
   });
   for (const f of st.fields) {

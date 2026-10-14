@@ -37,7 +37,7 @@ export function createSetupServer(opts: SetupServerOptions): http.Server {
   const templatePath = path.join(opts.root, ".env.example");
   const envPath = path.join(opts.root, ".env");
   const pagePath = opts.pagePath ?? path.join(__dirname, "index.html");
-  const readmeUrl = repoReadmeUrl(opts.root);
+  const docsUrl = repoDocsUrl(opts.root);
 
   const readTemplate = () => fs.readFileSync(templatePath, "utf8");
   const readEnv = (): Values | undefined => (fs.existsSync(envPath) ? parse(fs.readFileSync(envPath)) : undefined);
@@ -71,7 +71,7 @@ export function createSetupServer(opts: SetupServerOptions): http.Server {
       sections: SECTIONS,
       fields: FIELDS.map(f => ({ ...f, value: values[f.key], templateValue: defaults[f.key] ?? "" })),
       extras: Object.keys(env ?? {}).filter(k => !(k in defaults)),
-      readmeUrl,
+      docsUrl,
       validation: validate(values)
     };
   }
@@ -211,13 +211,14 @@ function sendJson(res: http.ServerResponse, status: number, body: unknown) {
   send(res, status, JSON.stringify(body), "application/json; charset=utf-8");
 }
 
-// "Learn more" links go to the README on the project's GitHub page.
-function repoReadmeUrl(root: string): string | undefined {
+// Base for "Learn more" links: the project's docs on GitHub (fields add
+// e.g. "README.md#4-deploy").
+function repoDocsUrl(root: string): string | undefined {
   try {
     const pkg = JSON.parse(fs.readFileSync(path.join(root, "package.json"), "utf8"));
     const url = typeof pkg.repository === "string" ? pkg.repository : pkg.repository?.url;
     if (!url) return undefined;
-    return `${url.replace(/^git\+/, "").replace(/\.git$/, "")}/blob/main/README.md`;
+    return `${url.replace(/^git\+/, "").replace(/\.git$/, "")}/blob/main/`;
   } catch {
     return undefined;
   }

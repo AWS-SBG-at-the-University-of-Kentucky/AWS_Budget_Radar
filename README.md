@@ -1,152 +1,68 @@
 # AWS Budget Radar
 
 A safety net for your personal AWS learning account. You set a monthly
-budget. If your spending crosses it, Budget Radar does two things.
+budget. If your spending crosses it, Budget Radar:
 
-1. **Blocks new spending.** Your day-to-day AWS identity loses the ability
-   to launch or start the expensive stuff (EC2, RDS, SageMaker, and so on)
-   until you lift the block.
-2. **Emails you a map of the damage.** You get a region-by-region list of
-   everything currently running and everything still costing you money, so
-   you know exactly what to go turn off.
+1. **Blocks new spending.** Your everyday AWS identity can't launch or start
+   the expensive stuff (EC2, RDS, SageMaker, and so on) until you lift the
+   block.
+2. **Emails you what's still running**, region by region, so you know exactly
+   what to turn off.
 
-Set `DAILY_DIGEST=true` to receive a **daily digest**, including quiet days,
-whether or not the budget has tripped. Billing data lags up to a day, so
-this can catch a forgotten notebook before it shows up as spend. The safe
-default is `false`, which creates no digest schedule
-(see [The daily digest](#the-daily-digest)).
+You can also get a daily "what's still running" email, and have AWS stop
+specific EC2/RDS instances you name. It costs (almost) nothing to run.
 
-You clone it, fill in one config file (a local setup page does it for you),
-run one deploy command, and let it sit. It costs (almost) nothing to run.
-
-> **Three honest limits, up front.**
+> **Know the limits**
 >
-> **It is not a hard spending cap.** AWS billing data lags 8 to 12 hours, so
-> charges can pass the threshold before the alert fires and keep accruing
-> after.
->
-> **It only turns off what you list.** Things already running keep running
-> until *you* stop them, unless you opt in to stopping specific EC2/RDS
-> instances ([4.6](#46-optional-stop-specific-instances-too)). The email tells
-> you what else is running and where.
->
-> **It only restrains the identities you list.** The root user and anything
-> you didn't list are unaffected. It's a seatbelt, not a security boundary.
+> - **It's not a hard spending cap.** AWS billing data lags 8 to 12 hours, so
+>   charges can pass your line before the alert fires, and keep growing after.
+> - **It doesn't turn things off for you** (unless you list specific
+>   instances). The email tells you what's running; you shut it down.
+> - **It only restrains the identities you list.** The root user and anything
+>   you didn't list are unaffected. It's a seatbelt, not a security boundary.
+> - **Some services aren't scanned:** EKS, OpenSearch, ElastiCache, Savings
+>   Plans/RI commitments, and data transfer.
 
----
+## Getting started
 
-## How it works (60 seconds)
-
-```
-your budget crosses the line (AWS checks ~2-3x/day)
-        │
-        ▼
- AWS Budgets "action" fires ──────────────► attaches a DENY policy to your
-        │                                   learning user, no new launches
-        ▼                                   or starts until it's lifted
- Radar's Lambda wakes up (read-only)
-        │  scans EVERY region: EC2, RDS, ECS, Lambda, SageMaker,
-        │  EBS, NAT gateways, idle IPs, load balancers, S3 sizes…
-        ▼
- 📧 email to you with what's blocked, what's running, and what to do next
-```
-
-Optionally, the same threshold can also **stop specific EC2/RDS instances**
-you list in `.env`. AWS Budgets does that itself by running AWS's own stop
-runbooks, so they're stopped, never terminated (see 4.6).
-
-Separately, once a day:
-
-```
-EventBridge schedule (DAILY_DIGEST_HOUR_UTC, default 13:00 UTC)
-        │
-        ▼
- Radar's digest Lambda (read-only) scans the same regions and services
-        │
-        ▼
- 📧 email every day when DAILY_DIGEST=true, including empty/incomplete scans
-```
-
-Two modes, set by one line of config:
-
-- **`watch` (default)** makes the block *wait for your approval*. The email
-  says "NOTHING IS BLOCKED YET" and gives you the approve command. Ignore
-  it and nothing is ever blocked.
-- **`armed`** applies the block automatically. The email is an
-  after-action report.
-
-The block is temporary either way. It **clears automatically when the next
-budget month starts**, or sooner if you reverse it (Part 4).
-
----
-
-## The whole journey at a glance
-
-| Step | What you do | You're done when… |
+| Step | What you do | You're done when |
 |---|---|---|
-| 1.1 | Create a *learning* IAM user, use it for daily work | User exists, and you work as it |
-| 1.2 | (Root, once) enable Billing console access | Toggle is on, or you skip it and use the CLI |
-| 1.3 | Install Node ≥ 20 + AWS CLI v2 | `node -v` and `aws sts get-caller-identity` both work |
-| 2.1 | Clone + `npm run setup` | The setup page opens in your browser |
-| 2.2 | Fill in the setup page, click **Save** | It says "Ready to deploy" |
-| 2.3 | `npx cdk bootstrap` (once per account/region) | "Environment bootstrapped" |
-| 3.1 | `npm run deploy` | "Preflight passed" then `✅ BudgetRadarStack` |
-| 3.2 | Click the SNS confirmation email | `npm run verify` shows no `PendingConfirmation` |
-|  | *Let it sit.* | You get an email if the budget ever trips, and a morning digest on days something is running |
-| 4 | On a trip, approve / lift the block | You know both commands (they're in the email) |
-| 5 | Someday, remove it | Reverse → verify detached → `cdk destroy` |
+| 1 | [Create a learning IAM user](#1-create-a-learning-iam-user) and work as it | You use that user day to day |
+| 2 | [Install Node.js and the AWS CLI](#2-install-the-tools) | `node -v` and `aws sts get-caller-identity` both work |
+| 3 | [Run `npm run setup` and fill in the page](#3-set-it-up) | The page says **Ready to deploy** |
+| 4 | [Deploy and confirm your email](#4-deploy) | `npm run verify` shows nothing pending |
 
----
+Then let it sit. [When your budget trips](#when-your-budget-trips) explains
+what to do if you ever get the email.
 
-# Part 1. Before you start (one-time account setup)
+## 1. Create a learning IAM user
 
-## 1.1 Create your learning IAM user (required)
+The block can only attach to IAM **users, groups, or roles**. It can't touch
+the root user or Identity Center (SSO) sign-ins. A new AWS account often has
+no IAM user at all, and if you do your daily work as root or as your SSO
+admin, **Budget Radar protects nothing.**
 
-The block can only attach to IAM **users, groups, or roles**. It cannot
-touch the **root user** or Identity Center/SSO sign-ins (`AWSReservedSSO_*`
-roles). A brand-new AWS account often has *no IAM user at all*. If you
-do your daily work as root or as your SSO admin, **the block never applies
-to you and Budget Radar protects nothing.**
+1. Sign in as root (or your admin), go to **IAM → Users → Create user**, and
+   name it something like `learning`.
+2. Choose **Attach policies directly** and attach **`AdministratorAccess`**.
+3. **Do your normal AWS work as that user** from now on, in the console and
+   the CLI.
+4. Keep a **separate admin** that is *not* blocked, such as your SSO admin
+   or a second IAM admin user (the root user can't be used for this). That's
+   your **recovery admin**: you deploy Radar as it, and it lifts the block
+   later.
 
-1. Sign in as root (or your admin) → **IAM → Users → Create user**, and
-   name it e.g. `learning`.
-2. On the permissions step choose **Attach policies directly** and attach
-   **`AdministratorAccess`** (the simplest option, and what the club uses).
-   Enable console access and/or access keys only if you need them, and keep
-   the credentials private.
-3. **From now on, do your normal AWS work as that user**, both console
-   sign-in and `aws configure`. Radar can't verify this for you. An
-   identity you don't actually use is an identity that isn't protected.
-4. Keep a **separate** admin identity (root, or your SSO admin) that you do
-   *not* list as a block target. That's your escape hatch. It lifts the
-   block later, and it's what you'll deploy Radar as.
+The learning user is an admin, so it *could* remove the block from itself.
+That's fine: this prevents accidents, it doesn't lock you out.
 
-> Since the learning user is an admin, it *could* detach the block from
-> itself. That's fine. This is accident-prevention for your own spending,
-> not a lock against you.
+## 2. Install the tools
 
-## 1.2 Enable Billing console access (root, once, recommended)
-
-By AWS default, IAM users **cannot open Billing/Budgets console pages**.
-Even with `AdministratorAccess` they see "access denied" there until the
-root user flips one switch. Sign in as root → account menu → **Account →
-IAM user and role access to Billing information → Activate**.
-
-This only gates the *console pages*. The **CLI/API is never gated**, and
-every command in this README works either way, so if you skip this step,
-just use the CLI commands in Part 4 instead of the console.
-
-## 1.3 Install the tools
-
-- **Node.js ≥ 20.** Check with `node -v`.
-- **AWS CLI v2**, configured with credentials for your account.
+- **Node.js 20 or newer.** Check with `node -v`.
+- **AWS CLI v2**, signed in to your account: `aws configure` for access keys,
+  or `aws configure sso` and then `aws sso login --profile <name>` for SSO.
   `aws sts get-caller-identity` should print your account number.
 
----
-
-# Part 2. Install and configure
-
-## 2.1 Clone and run setup
+## 3. Set it up
 
 ```bash
 git clone https://github.com/AWS-SBG-at-the-University-of-Kentucky/AWS_Budget_Radar.git
@@ -154,182 +70,85 @@ cd AWS_Budget_Radar
 npm run setup
 ```
 
-`npm run setup` checks your Node version, installs dependencies, creates
-`.env` from `.env.example` (it never overwrites an existing `.env`), and
-opens the setup page in your browser at `http://127.0.0.1:4000`.
+`npm run setup` checks your Node version, installs dependencies, creates your
+`.env` config file (it never overwrites one you already have), and opens the
+setup page at `http://127.0.0.1:4000`.
 
-## 2.2 Fill in `.env` with the setup page
+![The setup page: each question writes one line of your .env file](docs/images/setup-page-form.webp)
 
-`.env` is the only file Budget Radar reads. The setup page writes it for you:
+- **Answer the questions.** Each one shows the exact `.env` line it writes.
+- **Let AWS fill in the hard parts.** The page finds the AWS accounts you're
+  signed in to on this computer (read-only, free). Pick the one to protect,
+  and it lists your IAM users and fills in your recovery admin's ARN.
+- **Start in Watch mode.** The block waits for your OK, so nothing is blocked
+  until you approve it. You can switch to Armed later.
+- **Click Save** (or press Ctrl+S / ⌘S). The page checks your answers with the
+  same rules the deploy uses, and says **Ready to deploy** when nothing is
+  missing.
 
-1. Answer the six questions. Each field shows the exact `.env` line it
-   will write.
-2. The **Let AWS fill in the hard parts** box finds the AWS CLI profiles
-   you're signed in to (read-only, free). Pick the account to protect (it
-   picks for you if there's only one), and it lists that account's IAM users
-   and fills in your recovery admin's ARN. Profiles that aren't signed in
-   show the exact `aws sso login --profile …` command to fix them.
-3. Click **Save** (or press Ctrl+S / ⌘S). The page checks your answers with
-   the same validation the deploy uses, and says **Ready to deploy** when
-   nothing is missing.
+Come back any time with `npm run dev`. The page only runs on your computer and
+never deploys anything. Prefer a text editor? `.env` is plain text, and
+[every setting is explained here](docs/reference.md#settings).
 
-If you use a named profile (anything but `default`, which is common with
-`aws configure sso`), the deploy steps at the bottom of the page include
-`export AWS_PROFILE=<name>`. Run it in the terminal you deploy from:
-`npm run deploy` only uses that account if the terminal selects it.
+## 4. Deploy
 
-Saving keeps the comments from `.env.example`, and any extra settings you
-added to `.env` yourself (such as `AWS_PROFILE`). You can save a half-filled
-form and come back later with `npm run dev`. Press Ctrl+C in the terminal to
-stop the page.
+The bottom of the setup page lists these steps, ready to copy:
 
-> The page only listens on `127.0.0.1`, so nothing else on your network can
-> reach it. If port 4000 is busy it uses the next free port; the terminal
-> prints the address, and `BROWSER=none npm run dev` skips opening a
-> browser. Prefer a text editor? `.env` is plain text, so you can edit it
-> directly; the page and the deploy read the same file.
+![The deploy steps at the bottom of the setup page](docs/images/setup-page-deploy.webp)
 
-The fields, for reference. The essentials:
+1. **If you use a named AWS profile** (common with SSO), select it in the
+   terminal you deploy from. The setup page shows the name it found.
 
-| Field | What to put |
-|---|---|
-| `ALERT_EMAIL` | Where the alerts go. **Required.** |
-| `MONTHLY_BUDGET_USD` | Your monthly line, e.g. `5`. Use `0.01` for a "tell me on the very first cent" tripwire (see the note in Part 6, where Radar's own tiny footprint can eventually trip that one). |
-| `IAM_DENY_TARGET_USERS` | Your learning user from step 1.1, e.g. `learning`. **At least one target is required.** |
-| `RECOVERY_PRINCIPAL_ARN` | The **full ARN** of your separate admin from step 1.1, the identity that lifts the block. Must **not** also be a target. |
-| `SAFETY` | `watch` (default, block waits for your approval) or `armed` (applies automatically). **Start with `watch`.** |
+   ```bash
+   export AWS_PROFILE=<your-profile>
+   ```
 
-Less-common fields (all explained in the comments in `.env.example`):
+2. **Prepare your account for CDK**, once per account and region:
 
-- `EXISTING_BUDGET_NAME` leaves Radar to **create** its own budget when
-  empty (the normal path). Set it to attach to a budget you already made.
-  That budget must be a monthly, USD, unfiltered **cost** budget, and the
-  deploy check verifies this and refuses if it isn't.
-- `IAM_DENY_TARGET_GROUPS` / `_ROLES` add more targets. Use plain names, or
-  the full ARN if the identity lives under a non-root IAM path (the deploy
-  check will tell you if that's the case).
-- `WARN_AT_PERCENT`, `ACTION_THRESHOLD_PERCENT`, `ACTION_THRESHOLD_TYPE`,
-  `SERVICE_BUDGETS` are tuning knobs, and the defaults are sensible.
-- `TRACK_GROSS_USAGE` (default `true`) makes the budget count **gross usage** —
-  AWS credits and refunds are excluded, so usage trips the budget even while
-  promotional credits are covering your bill. This is what you want on a
-  credit-covered learning account: otherwise credits net your spend down to
-  ~$0.00 and the budget never fires until the credits run out. Set it to
-  `false` only if you want to be alerted on real out-of-pocket dollars.
-- `EXCLUDE_SERVICES` (default **empty**) is a comma-separated list of exact AWS
-  service names to leave **out** of the main budget. Empty keeps the budget
-  watching your **total** account cost (recommended). Setting it **scopes** the
-  budget to "everything except these services", so excluded spend no longer trips
-  it. The main use is excluding `AWS Cost Explorer` so the metered cost of
-  *checking* your bill (~$0.01 per Cost Explorer request) can't itself trip a tiny
-  tripwire — there's no runaway resource to shut down for that spend anyway. Use
-  sparingly: every service you exclude is a blind spot.
-- `STOP_EC2_INSTANCES` / `STOP_RDS_INSTANCES` (default **empty**) list
-  long-lived instances that AWS should **stop** at the same threshold as the
-  block. Empty means nothing is ever stopped. See
-  [4.6](#46-optional-stop-specific-instances-too).
+   ```bash
+   npx cdk bootstrap
+   ```
 
-- `DAILY_DIGEST` (default **false**) is a true/false toggle. `true` emails every
-  day; `false` creates no daily schedule or digest function. This opt-in default
-  preserves existing deployments and avoids adding unsolicited daily email/cost.
-  Legacy `findings`, `always`, and `off` values are rejected with a validation error:
-  replace them deliberately with `true` or `false`. `DAILY_DIGEST_HOUR_UTC`
-  defaults to `13` and accepts whole hours 0–23, without daylight-saving adjustment.
+3. **Deploy:**
 
-## 2.3 One-time bootstrap
+   ```bash
+   npm run deploy
+   ```
 
-```bash
-npx cdk bootstrap
-```
+   This runs read-only safety checks first and stops with a plain-English
+   reason if something is wrong (a typo'd user, a bad ARN, a budget that's
+   already over). Fix it and run it again. Don't use `npx cdk deploy`
+   directly; it skips the checks. You're done when you see
+   `Preflight passed.` and then `✅ BudgetRadarStack`.
 
-This prepares your account for CDK deployments (a small S3 bucket plus
-helper roles, shared by every CDK project, ~$0). It's needed **once per
-account/region**, and `deploy` fails without it. It reads your `.env`, so
-do 2.2 first (or run `npx cdk bootstrap --app "" aws://<account-id>/<region>`
-to skip that).
+4. **Confirm your email.** AWS sends an email titled *"AWS Notification -
+   Subscription Confirmation."* Click the link in it (check spam). Until you
+   do, alert emails go nowhere.
 
----
+5. **Check it worked**, using the `ReportTopicArn` printed at the end of the
+   deploy:
 
-# Part 3. Deploy
+   ```bash
+   npm run verify -- <ReportTopicArn>
+   ```
 
-## 3.1 `npm run deploy`
+   No `PendingConfirmation` means you're done. Now let it sit.
 
-```bash
-npm run deploy
-```
+## When your budget trips
 
-This is two things chained together, a **read-only preflight check** and,
-only if it passes, the actual `cdk deploy`.
+AWS checks budgets a few times a day, so the email arrives up to about half a
+day after the spending. It lists everything running and everything still
+costing you money, region by region. What happens next depends on your safety
+mode:
 
-The preflight is your co-pilot. It signs nothing and changes nothing. It
-verifies your `.env` against your real account and **refuses to deploy**
-(with a plain-English reason) if something would bite you later: a target
-that doesn't exist or is an unsupported type, a typo'd ARN, a recovery
-principal that can't actually lift the block, an existing budget of the
-wrong kind, or a budget that's *already* over its threshold. It also tells
-you whether your current credentials (and the CDK deploy roles) are
-covered by the block, so you're never surprised by who is and isn't
-restrained. **If it fails, read its message, fix `.env` (or IAM), and
-re-run.**
+| | Watch (default) | Armed |
+|---|---|---|
+| When the budget trips | Nothing is blocked yet. The email has the approve command. | The block applies automatically. The email reports it. |
+| If you ignore the email | Nothing is ever blocked | The block stays until next month, or until you lift it |
 
-You're done when you see `Preflight passed.` followed by
-`✅ BudgetRadarStack`.
-
-> Maintainers can see [`RELEASE.md`](./RELEASE.md), which tracks the
-> live-account validation status of this project and the rules for testing
-> it against a real (disposable) account.
-
-## 3.2 Confirm your email (don't skip this)
-
-AWS now sends you an email titled **"AWS Notification - Subscription
-Confirmation."** Click the link in it. **Until you do, alert emails go
-nowhere** (check spam). This gates *only* email (the block itself still
-works regardless), but a Radar whose emails vanish is half a Radar.
-
-Then prove the whole thing is wired:
-
-```bash
-npm run verify -- <ReportTopicArn>   # ARN is printed at the end of the deploy
-```
-
-Read-only. It lists your alert subscriptions and flags any still
-`PendingConfirmation`. Clean output means you're done. **Now let it sit.**
-
----
-
-# Part 4. The day your budget trips
-
-AWS evaluates budgets a few times a day, so the alert lands up to about
-half a day after the spend itself. Here's what happens when it does.
-
-## 4.1 You get one email
-
-Subject: `AWS Budget Radar: budget threshold reached — action PENDING`
-(in `watch` mode). Inside:
-
-- the account, budget, threshold, and the action's **observed status**
-- in `watch` mode, **"NOTHING IS BLOCKED YET"** plus the exact approve
-  command. In `armed` mode, confirmation the block applied, plus the exact
-  lift command.
-- the region-by-region inventory of what's running, plus a **"still costing
-  you money"** section (EBS volumes, NAT gateways, idle IPs, load
-  balancers, S3 storage), your to-go-turn-off list
-
-## 4.2 Decide (only in `watch` mode)
-
-- **Do nothing** → nothing is ever blocked, and the alert resets when the
-  new budget month starts.
-- **Approve the block** → run the command from the email (it's
-  `aws budgets execute-budget-action … --execution-type
-  APPROVE_BUDGET_ACTION`), or approve in the Budgets console if you did
-  step 1.2. The deny then attaches to your learning user, with no new
-  launches/starts until lifted.
-
-## 4.3 Lifting the block
-
-The block ends one of two ways. The **next budget month starts** (it
-detaches automatically, which is expected AWS behavior, not an iron
-guarantee), or you **reverse it now**, as your recovery principal:
+**To lift the block**, either wait for the next budget month (it clears by
+itself), or run the reverse command from the email as your recovery admin.
+The email fills in the values:
 
 ```bash
 aws budgets execute-budget-action \
@@ -337,296 +156,57 @@ aws budgets execute-budget-action \
   --execution-type REVERSE_BUDGET_ACTION
 ```
 
-(That's *reverse*, not "reset". See 4.4 before you ever press Reset.)
-Reversing un-blocks launches/starts. It does **not** restart anything. If
-you configured stop actions (4.6), those instances stay stopped until you
-start them. A reversed action is **done for the
-month**: AWS stops evaluating it and re-arms it on its own when the next
-budget month starts.
+Lifting the block doesn't restart anything you stopped.
 
-**Where to find the three values** (easiest first):
+**Don't press Reset mid-month.** If you're still over the line, AWS fires the
+block again on its next check. Reverse only, or
+[raise the threshold first](docs/reference.md#re-arming-mid-month-dont-just-press-reset).
 
-1. **The alert email.** The command arrives with the values filled in.
-2. **Console:** Lambda → Functions → `BudgetRadarStack-Reporter…` →
-   Configuration → Environment variables. `ACCOUNT_ID`, `BUDGET_NAME`,
-   `ACTION_ID` are right there.
-3. **CLI:** `aws budgets describe-budget-actions-for-account
-   --account-id <ACCOUNT_ID>` lists every action with its ids and status.
+**To switch modes**, change Safety mode on the setup page and run
+`npm run deploy` again. Try one real trip in Watch mode before choosing Armed.
 
-## 4.4 Re-arming mid-month (don't just press Reset)
+## Removing Budget Radar
 
-**Reset** (console button, or `--execution-type RESET_BUDGET_ACTION`) puts a
-reversed action back on standby *immediately*. The catch: AWS compares the
-threshold against your **month-to-date** spend, which never goes down within
-the month. If you're already past the threshold, the next budget refresh
-(every 8-12h) sees it crossed and **fires the action again**, even if you
-haven't spent another cent since. Reverse + Reset over and over just loops.
+Order matters. If the block is still attached when you run `cdk destroy`,
+the stack can't delete it, and the command to lift it is already gone.
 
-Pick one:
+1. **Lift the block** if it's applied (see above), or wait for the month to
+   end.
+2. **Check it's gone.** This should list nothing named `DenyNewSpend` (use
+   `list-attached-group-policies` or `list-attached-role-policies` for groups
+   and roles):
 
-- **Stay unprotected until the 1st (simplest).** Reverse only, never Reset.
-  AWS re-arms the action automatically when the new budget month starts.
-- **Re-arm above what you've already spent.** Raise the threshold past your
-  current spend first, *then* Reset. For example, if you're at 22% of the
-  budget and want about $2 of headroom on a $10 budget, set
-  `ACTION_THRESHOLD_PERCENT=45`, run `npm run deploy`, then Reset. Now it
-  only fires on genuinely new spend. If you're already over 100%, raise
-  `MONTHLY_BUDGET_USD` instead. The preflight will tell you if the new
-  threshold is still at or below your current spend.
-
-**Choosing thresholds up front:** a low automatic threshold (say 20%) is
-easy to cross with incidental charges, and after that it's either tripped
-or disabled for the rest of the month. Keep early warnings on
-`WARN_AT_PERCENT` (email only, never blocks) and put
-`ACTION_THRESHOLD_PERCENT` where you actually want the block, e.g. 80-100%.
-
-## 4.5 Switching between `watch` and `armed`
-
-Edit the one line in `.env`, then redeploy. That *is* the switch:
-
-```bash
-npm run deploy   # updates one property in ~30 seconds
-```
-
-|  | `watch` (default) | `armed` |
-|---|---|---|
-| Threshold crossed → | Goes `PENDING`, email plus approve command, waits for you | Block applies automatically, email reports it |
-| If you ignore the email | Nothing blocked, resets next month | Already blocked, reverse (4.3) or wait for the reset |
-
-The preflight holds `armed` to a higher bar. It **refuses** an armed deploy
-if it can't verify your recovery route, or if the budget is *already* over
-threshold (that would be lockout-by-deploy, and `watch` merely warns on
-both). The recommended arc is to run `watch` through one real trip
-(approve, see the block, reverse it with your own hands), and only then
-consider `armed`.
-
-## 4.6 Optional: stop specific instances too
-
-The block stops *new* spend, but a big instance you already have keeps
-billing. For **long-lived instances you know about ahead of time** (a
-practice database, a dev box), you can have AWS stop them at the same
-threshold. List them in `.env`:
-
-```bash
-STOP_EC2_INSTANCES=i-0123456789abcdef0,us-west-2:i-0fedcba9876543210
-STOP_RDS_INSTANCES=practice-db
-```
-
-A bare ID means the region you deploy to. Prefix `region:` for anything
-else. Each region and type becomes one native budget action
-(`RUN_SSM_DOCUMENTS`), up to 100 instances each.
-
-What happens:
-
-- At the threshold, AWS Budgets runs AWS's own `AWS-StopEC2Instance` /
-  `AWS-StopRdsInstance` runbooks. Instances are **stopped, never terminated
-  or deleted**. EBS and RDS persistent storage is retained, but EC2 instance-store
-  data is erased by a stop. Preflight rejects instance-storage-capable EC2 types,
-  including EBS-root types with local disks. Storage, provisioned IOPS, backups
-  and applicable IP charges continue; stopping reduces compute charges.
-- It follows `SAFETY` just like the block. In `watch` mode each stop action
-  goes `PENDING` and the email has a separate approve command for it. In
-  `armed` mode AWS stops them automatically.
-- AWS sends its own short notice for each stop action, and Radar's report
-  lists every stop action's status and instances.
-- Stopped instances **stay stopped** until someone starts them. While the
-  block is applied your learning identity can't start them either (the
-  deny covers `ec2:StartInstances` / `rds:StartDBInstance`), so start them
-  as your recovery principal. AWS **restarts a stopped RDS DB instance by
-  itself after 7 days**, even while the learner deny remains applied; compute
-  charges resume and this monthly action does not continuously re-stop it.
-- Like the block, a stop action runs once per budget month. Start an
-  instance again mid-month and it won't be re-stopped until the next month
-  (or a Reset, see 4.4 for the caveat).
-
-The preflight looks up every listed instance and **refuses to deploy**
-if one doesn't exist, is already terminated, or can't be stopped this way:
-
-- **Auto Scaling group members.** The group would just replace them. Scale
-  the group down yourself instead.
-- **Instance-store-backed or instance-storage-capable EC2 types.** Root type alone
-  cannot establish data safety; unknown storage capability also fails closed.
-- **API stop protection.** `DisableApiStop` must be verified false. Radar never
-  changes this attribute or grants the stop role permission to modify it.
-- **Aurora / DB cluster members, read replicas and instances with replicas,
-  and SQL Server Multi-AZ.** AWS cannot stop these this way.
-
-It warns on Spot Instances, since only Spot Instances from a persistent
-request can be stopped.
-
-**Why only listed instances?** AWS's native stop action needs the instance
-IDs when it's created, so it can't catch something you launch tomorrow. For
-that, lean on the block (no new launches) and the report's inventory.
-
-The execution role AWS uses is scoped to exactly these instances and only
-AWS's stop/start runbooks, and it can only act *through* Systems Manager. It
-can't terminate, delete, or modify anything.
-
----
-
-# Part 5. Removing Budget Radar
-
-Order matters here. `cdk destroy` deletes the budget action *before* the
-deny policy, so if the block is attached when you run it, the policy can't
-be deleted (IAM refuses while it's attached), **and the reverse command no
-longer exists to detach it**. Do it in this order and you'll never hit that:
-
-1. **If the block is currently applied, lift it first** (4.3), or wait for
-   the month to reset it.
-2. **Verify it's detached:**
    ```bash
    aws iam list-attached-user-policies --user-name <your-learning-user>
    ```
-   (`list-attached-group-policies` / `list-attached-role-policies` for
-   other target types.) Confirm nothing named `DenyNewSpend` is listed.
-3. **Then:**
+
+3. **Remove the stack:**
+
    ```bash
    npx cdk destroy
    ```
 
-**If you skipped ahead** and destroy failed on `DeleteManagedPolicy`,
-detach directly, then re-run destroy:
+If `cdk destroy` already failed on `DeleteManagedPolicy`, detach the policy
+by hand (use `detach-group-policy` or `detach-role-policy` for groups and
+roles), then run destroy again:
 
 ```bash
-aws iam detach-user-policy  --user-name  <name> --policy-arn <DenyNewSpendPolicyArn>
-aws iam detach-group-policy --group-name <name> --policy-arn <DenyNewSpendPolicyArn>
-aws iam detach-role-policy  --role-name  <name> --policy-arn <DenyNewSpendPolicyArn>
+aws iam detach-user-policy --user-name <name> --policy-arn <DenyNewSpendPolicyArn>
 ```
 
-If native stop actions were configured, inspect the current EC2/RDS state
-and recover resources using an authorized operator identity when needed.
-Destroying this stack does not establish that stopped resources restarted;
-SSM action reversal/restart behavior has not been verified live.
-(`cdk destroy` with the block *never applied* is the clean case, verified
-by live testing, see `RELEASE.md` item 8. The bootstrap stack, `CDKToolkit`,
-is shared with other CDK projects and stays. It costs ~$0.)
-
----
-
-# Part 6. Reference
-
-## What the block does and doesn't stop
-
-The deny is a **positive list**. Only these actions are denied, and only
-for the identities you listed. Everything else they could do, they still
-can.
-
-**Denied** (creation/start only, never reads, never IAM/Budgets/
-CloudFormation, never cleanup/scale-down):
-`ec2:RunInstances`, `ec2:StartInstances`, `ec2:RequestSpotInstances`,
-`ec2:RequestSpotFleet`, `ec2:CreateFleet`, `rds:CreateDBInstance`,
-`rds:CreateDBCluster`, `rds:StartDBInstance`, `rds:StartDBCluster`,
-`elasticmapreduce:RunJobFlow`, `sagemaker:CreateNotebookInstance`,
-`sagemaker:StartNotebookInstance`, `sagemaker:CreateEndpoint`,
-`sagemaker:CreateApp`, `sagemaker:CreateTrainingJob`, `ecs:RunTask`,
-`ecs:CreateService`, `autoscaling:CreateAutoScalingGroup`,
-`lambda:CreateFunction`.
-
-Two consequences worth knowing:
-
-- **A blocked identity can't restart its own stopped EC2/RDS** while the
-  block is active. That's intended, because restarting resumes spend. It
-  clears at the month reset or when you reverse.
-- **Scale-downs stay allowed.** `autoscaling:UpdateAutoScalingGroup` and
-  `ecs:UpdateService` (e.g. scaling to zero) are deliberately *not* denied,
-  so the block never stops you from doing what its own email asks of you.
-
-**NOT blocked** (the gaps most likely to surprise you). **EKS, Redshift,
-ElastiCache, OpenSearch, and Bedrock** have none of their
-create/start/invoke actions listed. Anything launched via a
-**service-linked role** runs as a different principal than your user. Any
-identity you didn't list is free. And the root user is never blocked.
-
-## The daily digest
-
-The budget can only react to billing data, which lags real usage by up to
-a day. The digest doesn't wait for billing. Once a day an EventBridge
-schedule runs a second, read-only Lambda that scans the same regions and
-services as the trip report (below) and emails what it finds. Like the
-trip report, it **never stops or changes anything**.
-
-Each digest shows:
-
-- month-to-date spend against your budget, plus AWS's forecast for the month
-- the block's current status, with the approve command if it's waiting on you
-- everything still running or billing, grouped by service and region
-- coverage gaps (regions/services it couldn't check), labeled as such
-
-**When it emails:** set `DAILY_DIGEST=true` for an email every day, including
-empty or incomplete scans. `DAILY_DIGEST=false` (default) removes the schedule
-and digest Lambda. The digest includes every configured stop action, with
-`UNKNOWN` for denied, failed or deadline-skipped lookups. Action success records
-past execution, not the current power state of a resource.
-
-EventBridge delivery failures go to the failure queue, as do exhausted Lambda
-async execution failures. Both retry paths have a two-hour event-age limit;
-the handler also checks the original schedule timestamp before scanning and
-publishing, rejecting missing/invalid or stale timestamps. Inspect the queue
-and logs if email fails; scheduling is best effort, not guaranteed delivery.
-
-
-Unavailable services and regions are listed as coverage gaps in each enabled daily email.
-
-**Left out of the digest on purpose:** plain Lambda functions (free while
-idle, and Radar's own functions always exist, so they'd make every digest
-non-empty) and S3 bucket sizes (the CDK bootstrap bucket always exists).
-Lambda *provisioned concurrency*, which does bill while idle, is included.
-The trip report still covers both.
-
-Change the toggle or hour in `.env`, then `npm run deploy` again.
-
-## What the report covers and its gaps
-
-The report **describes. It never acts.** Denied or failed scans are labeled
-as failures, never passed off as "nothing found."
-
-| Area | Reported | Note |
-|---|---|---|
-| EC2 (standalone / ASG) | Running instances, ASG membership | Not stopped, EBS/IP costs continue |
-| RDS / Aurora | Instances and clusters | Storage/backups bill regardless |
-| ECS / Fargate | Services, standalone tasks | REPLICA/DAEMON noted |
-| Lambda | Functions, reserved vs provisioned concurrency | Provisioned concurrency bills separately |
-| SageMaker | Notebooks, endpoints | Endpoints/Studio/jobs bill regardless |
-| Storage/network | EBS, S3 sizes, NAT gateways, idle IPs, load balancers | The classic silent spenders |
-| **Not scanned** | EKS control plane, OpenSearch, ElastiCache, Savings Plans/RI commitments, data transfer | Known gaps, absent from the report entirely |
-
-## Cost of Radar itself
-
-Near-zero, but **not guaranteed $0.00**:
-
-| Item | Cost |
-|---|---|
-| The budget + action(s) | Free (first 2 action-enabled budgets per account; the optional stop actions live on the same budget) |
-
-| Lambda + SNS email | Free tier at this volume. The trip reporter only runs on a trip, the digest once a day (a scan of a minute or so) |
-| EventBridge schedule | Free (scheduled rules have no charge) |
-| CloudWatch Logs | Pennies at most, capped by 30-day retention |
-| CDK bootstrap S3 | A few KB of storage, shared |
-
-On a `0.01` tripwire, Radar's own footprint (logs, requests) can eventually
-be the thing that trips it. That's the tripwire working, not a bug.
-
-> **Watch your budget on the Budgets page, not Cost Explorer.** The Cost
-> Explorer **API costs $0.01 per request**, and both the `aws ce
-> get-cost-and-usage` CLI command and the console's "Cost and usage" /
-> Cost Explorer widgets issue those requests. If you set a tiny tripwire
-> (e.g. `$0.01`) and then anxiously refresh Cost Explorer to watch it,
-> **the checking itself can be what trips the budget.** To watch spend for
-> free, use **Billing → Budgets**, where your budget's "Current spend" is
-> exactly what the action evaluates. The Budgets API and page are not
-> billed per request.
+If you set up instance stop actions, check your EC2/RDS instances yourself
+afterwards and start them as your recovery admin if needed. Removing the stack
+isn't guaranteed to restart them.
 
 ## Troubleshooting
 
-**Preflight refused to deploy.** That's it working. The message names the
-exact problem (unknown target, bad ARN, wrong budget type, unverifiable
-recovery, already-breached budget). Fix that one thing, re-run.
+**The deploy check refused to deploy.** That's it working. Its message names
+the exact problem. Fix that one thing and run `npm run deploy` again.
 
-**Deploy fails with "Token is expired" or "Could not load credentials."**
-The terminal you deploy from is using a different AWS profile than the one
-you signed in with (with no `AWS_PROFILE` set, it's `default`), or that
-sign-in has expired. In the same terminal, sign in and select the profile,
-then deploy again (`aws configure list-profiles` shows the names):
+**Deploy says "Token is expired" or "Could not load credentials."** Your
+terminal is using a different AWS profile than the one you signed in with
+(with no `AWS_PROFILE` set, it uses `default`), or your sign-in expired. In
+the same terminal (`aws configure list-profiles` shows the names):
 
 ```bash
 aws sso login --profile <your-profile>
@@ -634,51 +214,16 @@ export AWS_PROFILE=<your-profile>
 npm run deploy
 ```
 
-**Budgets/Billing console says "access denied."** You're an IAM user and
-root hasn't enabled Billing access (1.2). Either flip that switch as root,
-or use the CLI commands in Part 4, which are never gated.
+**The budget tripped but no email came** (after about 12 hours). Run
+`npm run verify -- <ReportTopicArn>`. An unconfirmed email subscription is
+the usual cause, so click the confirmation email.
 
-**Breach happened but no email (after ~12h).** In order:
-1. `npm run verify -- <ReportTopicArn>`. An unconfirmed subscription is
-   the #1 cause, so click the confirmation email.
-2. Check the **`ReporterFailures` SQS queue** (SQS console → the queue
-   containing `ReporterFailures` → *Send and receive messages* → *Poll*).
-   A message there can indicate EventBridge delivery failure or Lambda execution failure; inspect its attributes and body.
-3. Check the reporter's **CloudWatch Logs** (Lambda console → the
-   `BudgetRadarStack-Reporter…` function → Monitor → Logs) to see whether
-   it ran at all.
+[More troubleshooting](docs/reference.md#troubleshooting)
 
-**No daily digest.** Confirm `DAILY_DIGEST=true`, email subscription confirmation,
-the deployed rule/function, and the failure queue and logs. `false` disables it.
+## Learn more
 
-
-**The block keeps re-applying after I lift it.** You pressed Reset (or ran
-`RESET_BUDGET_ACTION`) while month-to-date spend was still over the
-threshold, so the next refresh fired it again. Reverse only, or raise the
-threshold above current spend before resetting (4.4).
-
-**`cdk destroy` failed on `DeleteManagedPolicy`.** The block was still
-attached. Use the manual detach commands in Part 5, then re-run destroy.
-
-**Who exactly is covered?** The preflight's deploy output lists every
-resolved target, whether *your* current credentials are covered, and
-whether the CDK deploy roles are. Nothing is guessed, and "unknown" is
-printed when it can't be determined.
-
-AWS semantics: [EC2 stop/start](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/Stop_Start.html),
-[API stop protection](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/ec2-stop-protection.html),
-[RDS stopping limits, restart and charges](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/USER_StopInstance.html),
-and [Budgets/SSM managed policy](https://docs.aws.amazon.com/aws-managed-policy/latest/reference/AWSBudgetsActions_RolePolicyForResourceAdministrationWithSSM.html).
-Reversing the IAM deny does not restart resources. Whether reversing a separate
-SSM stop action restarts them remains unverified and requires authorized live
-acceptance testing; use the recovery principal and check current state explicitly.
-Set AWS_REGION and CDK_DEFAULT_REGION consistently (or only one); conflicting
-values are rejected by both preflight and synthesis.
-
-Digest reliability references: [EventBridge delivery DLQ and scoped queue permission](https://docs.aws.amazon.com/eventbridge/latest/userguide/eb-rule-dlq.html)
-and [Lambda asynchronous event age and failure destinations](https://docs.aws.amazon.com/lambda/latest/dg/invocation-async-configuring.html).
-Preflight stop checks require read-only `ec2:DescribeInstances`,
-`ec2:DescribeInstanceAttribute`, `ec2:DescribeInstanceTypes`, and
-`rds:DescribeDBInstances` on the deployment caller; the execution role gains no
-permission to change stop protection. Lifecycle checks reflect deployment time:
-resources or protection settings changed later still require operator attention.
+The [reference guide](docs/reference.md) covers how it works, every setting,
+exactly what the block stops (and what it doesn't), the daily digest,
+stopping specific instances, what the report covers, and what Radar itself
+costs. Maintainers: see [`RELEASE.md`](./RELEASE.md) for live-account testing
+rules.
