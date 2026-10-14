@@ -11,6 +11,8 @@
     "budget-radar": "bin/budget-radar.js"
   },
   "scripts": {
+    "setup": "node setup/bootstrap.mjs",
+    "dev": "ts-node --prefer-ts-exts setup/server.ts",
     "build": "tsc",
     "test": "jest",
     "synth": "cdk synth",

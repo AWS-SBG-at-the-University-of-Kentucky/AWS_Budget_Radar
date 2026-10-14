@@ -16,8 +16,8 @@ this can catch a forgotten notebook before it shows up as spend. The safe
 default is `false`, which creates no digest schedule
 (see [The daily digest](#the-daily-digest)).
 
-You clone it, fill in one config file, run one deploy command, and let it
-sit. It costs (almost) nothing to run.
+You clone it, fill in one config file (a local setup page does it for you),
+run one deploy command, and let it sit. It costs (almost) nothing to run.
 
 > **Three honest limits, up front.**
 >
@@ -87,8 +87,8 @@ budget month starts**, or sooner if you reverse it (Part 4).
 | 1.1 | Create a *learning* IAM user, use it for daily work | User exists, and you work as it |
 | 1.2 | (Root, once) enable Billing console access | Toggle is on, or you skip it and use the CLI |
 | 1.3 | Install Node ≥ 20 + AWS CLI v2 | `node -v` and `aws sts get-caller-identity` both work |
-| 2.1 | Clone + `npm install` | No errors |
-| 2.2 | Fill in `.env` | Every REQUIRED field set |
+| 2.1 | Clone + `npm run setup` | The setup page opens in your browser |
+| 2.2 | Fill in the setup page, click **Save** | It says "Ready to deploy" |
 | 2.3 | `npx cdk bootstrap` (once per account/region) | "Environment bootstrapped" |
 | 3.1 | `npm run deploy` | "Preflight passed" then `✅ BudgetRadarStack` |
 | 3.2 | Click the SNS confirmation email | `npm run verify` shows no `PendingConfirmation` |
@@ -146,18 +146,50 @@ just use the CLI commands in Part 4 instead of the console.
 
 # Part 2. Install and configure
 
-## 2.1 Clone and install
+## 2.1 Clone and run setup
 
 ```bash
 git clone https://github.com/AWS-SBG-at-the-University-of-Kentucky/AWS_Budget_Radar.git
 cd AWS_Budget_Radar
-npm install
-cp .env.example .env
+npm run setup
 ```
 
-## 2.2 Fill in `.env`
+`npm run setup` checks your Node version, installs dependencies, creates
+`.env` from `.env.example` (it never overwrites an existing `.env`), and
+opens the setup page in your browser at `http://127.0.0.1:4000`.
 
-`.env` is the only file you edit. The essentials:
+## 2.2 Fill in `.env` with the setup page
+
+`.env` is the only file Budget Radar reads. The setup page writes it for you:
+
+1. Answer the six questions. Each field shows the exact `.env` line it
+   will write.
+2. The **Let AWS fill in the hard parts** box finds the AWS CLI profiles
+   you're signed in to (read-only, free). Pick the account to protect (it
+   picks for you if there's only one), and it lists that account's IAM users
+   and fills in your recovery admin's ARN. Profiles that aren't signed in
+   show the exact `aws sso login --profile …` command to fix them.
+3. Click **Save** (or press Ctrl+S / ⌘S). The page checks your answers with
+   the same validation the deploy uses, and says **Ready to deploy** when
+   nothing is missing.
+
+If you use a named profile (anything but `default`, which is common with
+`aws configure sso`), the deploy steps at the bottom of the page include
+`export AWS_PROFILE=<name>`. Run it in the terminal you deploy from:
+`npm run deploy` only uses that account if the terminal selects it.
+
+Saving keeps the comments from `.env.example`, and any extra settings you
+added to `.env` yourself (such as `AWS_PROFILE`). You can save a half-filled
+form and come back later with `npm run dev`. Press Ctrl+C in the terminal to
+stop the page.
+
+> The page only listens on `127.0.0.1`, so nothing else on your network can
+> reach it. If port 4000 is busy it uses the next free port; the terminal
+> prints the address, and `BROWSER=none npm run dev` skips opening a
+> browser. Prefer a text editor? `.env` is plain text, so you can edit it
+> directly; the page and the deploy read the same file.
+
+The fields, for reference. The essentials:
 
 | Field | What to put |
 |---|---|
@@ -589,6 +621,18 @@ be the thing that trips it. That's the tripwire working, not a bug.
 **Preflight refused to deploy.** That's it working. The message names the
 exact problem (unknown target, bad ARN, wrong budget type, unverifiable
 recovery, already-breached budget). Fix that one thing, re-run.
+
+**Deploy fails with "Token is expired" or "Could not load credentials."**
+The terminal you deploy from is using a different AWS profile than the one
+you signed in with (with no `AWS_PROFILE` set, it's `default`), or that
+sign-in has expired. In the same terminal, sign in and select the profile,
+then deploy again (`aws configure list-profiles` shows the names):
+
+```bash
+aws sso login --profile <your-profile>
+export AWS_PROFILE=<your-profile>
+npm run deploy
+```
 
 **Budgets/Billing console says "access denied."** You're an IAM user and
 root hasn't enabled Billing access (1.2). Either flip that switch as root,

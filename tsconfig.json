@@ -11,6 +11,6 @@
     "skipLibCheck": true,
     "types": ["node", "jest"]
   },
-  "include": ["bin/**/*.ts", "lib/**/*.ts", "test/**/*.ts", "preflight.ts"],
+  "include": ["bin/**/*.ts", "lib/**/*.ts", "setup/**/*.ts", "test/**/*.ts", "preflight.ts"],
   "exclude": ["node_modules", "cdk.out"]
 }
