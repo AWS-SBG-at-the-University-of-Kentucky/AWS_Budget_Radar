@@ -1,0 +1,1041 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Budget Radar Setup</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ccircle cx='16' cy='16' r='14' fill='%2307130e' stroke='%235cf29b' stroke-width='2'/%3E%3Ccircle cx='16' cy='16' r='7' fill='none' stroke='%235cf29b' stroke-opacity='.5'/%3E%3Cpath d='M16 16 L27 9' stroke='%235cf29b' stroke-width='2.5' stroke-linecap='round'/%3E%3Ccircle cx='21' cy='20' r='2.2' fill='%23ffb547'/%3E%3C/svg%3E">
+<style>
+/* ---------- tokens ---------- */
+:root {
+  --bg: #06110c;
+  --bg-glow: rgba(46, 160, 98, .16);
+  --grid: rgba(92, 242, 155, .045);
+  --panel: #0b1c15;
+  --panel-2: #0f241b;
+  --field: #071510;
+  --line: #1d3d2f;
+  --line-strong: #2b5a45;
+  --ink: #e4f3ea;
+  --ink-2: #a3c2b2;
+  --ink-3: #6a8f7d;
+  --accent: #5cf29b;
+  --accent-ink: #03150b;
+  --accent-soft: rgba(92, 242, 155, .12);
+  --amber: #ffb547;
+  --amber-soft: rgba(255, 181, 71, .12);
+  --red: #ff7a6b;
+  --red-soft: rgba(255, 122, 107, .12);
+  --shadow: 0 1px 0 rgba(255,255,255,.03) inset, 0 20px 50px -30px rgba(0,0,0,.8);
+  --font-display: "DIN Alternate", "DIN Condensed", Bahnschrift, "D-DIN", "Barlow Semi Condensed", "Roboto Condensed", "Arial Narrow", sans-serif;
+  --font-body: "Avenir Next", "Segoe UI Variable Text", "Segoe UI", Seravek, Ubuntu, Cantarell, "Helvetica Neue", sans-serif;
+  --font-mono: "SF Mono", "JetBrains Mono", "Cascadia Code", "Fira Code", ui-monospace, Menlo, Consolas, monospace;
+  --radius: 14px;
+  color-scheme: dark;
+}
+@media (prefers-color-scheme: light) {
+  :root {
+    --bg: #f1efe6;
+    --bg-glow: rgba(13, 138, 79, .10);
+    --grid: rgba(13, 90, 55, .06);
+    --panel: #fbfaf4;
+    --panel-2: #f5f3ea;
+    --field: #ffffff;
+    --line: #dcdccf;
+    --line-strong: #b9c2b1;
+    --ink: #10271d;
+    --ink-2: #3f5b4d;
+    --ink-3: #6b8075;
+    --accent: #0b8a4c;
+    --accent-ink: #ffffff;
+    --accent-soft: rgba(11, 138, 76, .10);
+    --amber: #a8610a;
+    --amber-soft: rgba(168, 97, 10, .10);
+    --red: #b8372a;
+    --red-soft: rgba(184, 55, 42, .08);
+    --shadow: 0 1px 0 rgba(255,255,255,.8) inset, 0 18px 40px -28px rgba(20, 40, 30, .35);
+    color-scheme: light;
+  }
+}
+
+/* ---------- base ---------- */
+* { box-sizing: border-box; }
+[hidden] { display: none !important; }
+html { scroll-behavior: smooth; scroll-padding-top: 24px; }
+body {
+  margin: 0;
+  background:
+    radial-gradient(900px 600px at 12% -10%, var(--bg-glow), transparent 60%),
+    radial-gradient(700px 500px at 110% 20%, var(--bg-glow), transparent 55%),
+    linear-gradient(var(--grid) 1px, transparent 1px) 0 0 / 32px 32px,
+    linear-gradient(90deg, var(--grid) 1px, transparent 1px) 0 0 / 32px 32px,
+    var(--bg);
+  background-attachment: fixed;
+  color: var(--ink);
+  font: 16px/1.55 var(--font-body);
+  -webkit-font-smoothing: antialiased;
+}
+a { color: var(--accent); text-underline-offset: 3px; }
+code, .mono { font-family: var(--font-mono); font-size: .88em; }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 6px; }
+button { font: inherit; color: inherit; }
+
+.shell {
+  max-width: 1180px;
+  margin: 0 auto;
+  padding: 32px 24px 80px;
+  display: grid;
+  grid-template-columns: 300px minmax(0, 1fr);
+  gap: 40px;
+  align-items: start;
+}
+
+/* ---------- side panel ---------- */
+.panel {
+  position: sticky;
+  top: 24px;
+  background: color-mix(in srgb, var(--panel) 88%, transparent);
+  backdrop-filter: blur(6px);
+  border: 1px solid var(--line);
+  border-radius: 20px;
+  padding: 22px 20px 20px;
+  box-shadow: var(--shadow);
+}
+.brand { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
+.brand b {
+  font: 700 13px/1 var(--font-display);
+  letter-spacing: .22em;
+  text-transform: uppercase;
+}
+.brand span {
+  font: 600 11px/1 var(--font-mono);
+  color: var(--accent);
+  letter-spacing: .08em;
+}
+
+.radar {
+  --size: 176px;
+  position: relative;
+  width: var(--size);
+  height: var(--size);
+  margin: 22px auto 18px;
+  border-radius: 50%;
+  background: radial-gradient(circle, var(--accent-soft), transparent 70%), var(--field);
+  border: 1px solid var(--line-strong);
+  overflow: hidden;
+  box-shadow: 0 0 0 6px var(--panel-2), 0 0 0 7px var(--line);
+}
+.radar .ring { position: absolute; inset: 0; margin: auto; border: 1px solid var(--line-strong); border-radius: 50%; opacity: .7; }
+.radar .ring:nth-child(1) { width: 66%; height: 66%; }
+.radar .ring:nth-child(2) { width: 33%; height: 33%; }
+.radar .axis { position: absolute; background: var(--line-strong); opacity: .6; }
+.radar .axis.h { left: 0; right: 0; top: 50%; height: 1px; }
+.radar .axis.v { top: 0; bottom: 0; left: 50%; width: 1px; }
+.radar .sweep {
+  position: absolute; inset: 0; border-radius: 50%;
+  background: conic-gradient(from 0deg, transparent 0 280deg, color-mix(in srgb, var(--accent) 6%, transparent) 300deg, color-mix(in srgb, var(--accent) 38%, transparent) 359deg, var(--accent) 360deg);
+  animation: sweep 4.8s linear infinite;
+}
+@keyframes sweep { to { transform: rotate(360deg); } }
+.blip {
+  position: absolute; left: 50%; top: 50%;
+  width: 9px; height: 9px; margin: -4.5px 0 0 -4.5px;
+  border-radius: 50%;
+  transform: rotate(var(--a)) translateX(var(--d)) rotate(calc(-1 * var(--a)));
+  background: var(--amber);
+  opacity: .55;
+  transition: background .4s, opacity .4s, box-shadow .4s;
+}
+.blip[data-state="done"] { background: var(--accent); opacity: 1; box-shadow: 0 0 10px var(--accent), 0 0 2px var(--accent); }
+.blip[data-state="error"] { background: var(--red); opacity: 1; box-shadow: 0 0 10px var(--red); }
+.radar.ping::after {
+  content: ""; position: absolute; inset: 50%; border-radius: 50%;
+  border: 2px solid var(--accent);
+  animation: ping 1s ease-out forwards;
+}
+@keyframes ping { to { inset: -10%; opacity: 0; } }
+
+.checklist { list-style: none; margin: 0 0 18px; padding: 0; counter-reset: q; }
+.checklist a {
+  display: grid; grid-template-columns: 14px 26px 1fr; align-items: center; gap: 6px;
+  padding: 7px 8px; border-radius: 9px;
+  color: var(--ink-2); text-decoration: none; font-size: 14.5px;
+}
+.checklist a:hover { background: var(--panel-2); color: var(--ink); }
+.checklist .num { font: 600 11px/1 var(--font-mono); color: var(--ink-3); }
+.checklist .dot { width: 8px; height: 8px; border-radius: 50%; border: 1.5px solid var(--amber); transition: all .3s; }
+.checklist li[data-state="done"] .dot { background: var(--accent); border-color: var(--accent); box-shadow: 0 0 8px var(--accent); }
+.checklist li[data-state="done"] a { color: var(--ink); }
+.checklist li[data-state="error"] .dot { background: var(--red); border-color: var(--red); }
+
+.savebox { border-top: 1px dashed var(--line-strong); padding-top: 16px; }
+.btn-primary {
+  width: 100%;
+  display: flex; align-items: center; justify-content: center; gap: 10px;
+  padding: 13px 16px;
+  border: 0; border-radius: 12px;
+  background: var(--accent); color: var(--accent-ink);
+  font: 700 15px/1 var(--font-display); letter-spacing: .14em; text-transform: uppercase;
+  cursor: pointer;
+  box-shadow: 0 10px 24px -12px var(--accent);
+  transition: transform .12s, box-shadow .2s, opacity .2s;
+}
+.btn-primary:hover { transform: translateY(-1px); box-shadow: 0 14px 28px -12px var(--accent); }
+.btn-primary:active { transform: translateY(0); }
+.btn-primary[disabled] { opacity: .6; cursor: progress; }
+.btn-primary kbd { font: 500 11px/1 var(--font-mono); opacity: .7; letter-spacing: 0; text-transform: none; }
+.btn-primary .fname { font-family: var(--font-mono); text-transform: none; letter-spacing: 0; }
+
+.status { margin: 14px 2px 0; font-size: 14px; color: var(--ink-2); min-height: 1.5em; }
+.status .head { display: flex; align-items: center; gap: 8px; font-weight: 600; color: var(--ink); }
+.status .light { width: 9px; height: 9px; border-radius: 50%; flex: none; background: var(--amber); }
+.status[data-tone="ok"] .light { background: var(--accent); box-shadow: 0 0 8px var(--accent); }
+.status[data-tone="bad"] .light { background: var(--red); }
+.status .detail { margin: 6px 0 0; font-size: 13.5px; }
+.status .detail code { word-break: break-word; }
+.linkish { background: none; border: 0; padding: 0; color: var(--accent); cursor: pointer; text-decoration: underline; text-underline-offset: 3px; font-size: 13.5px; }
+
+/* ---------- main column ---------- */
+.intro { padding: 10px 0 8px; }
+.eyebrow {
+  margin: 0 0 14px;
+  font: 600 12px/1 var(--font-mono);
+  letter-spacing: .14em; text-transform: uppercase;
+  color: var(--accent);
+}
+.eyebrow::before { content: "● "; animation: blink 2.4s steps(1) infinite; }
+@keyframes blink { 50% { opacity: .25; } }
+h1 {
+  margin: 0 0 14px;
+  font: 700 clamp(34px, 5vw, 54px)/1.02 var(--font-display);
+  letter-spacing: -.01em;
+  text-wrap: balance;
+}
+.lede { margin: 0; max-width: 62ch; font-size: 17.5px; color: var(--ink-2); }
+.lede b { color: var(--ink); }
+.filechip {
+  display: inline-flex; flex-wrap: wrap; align-items: center; gap: 8px;
+  margin: 18px 0 0; padding: 7px 12px;
+  border: 1px solid var(--line); border-radius: 12px;
+  background: var(--panel); font-size: 13px; color: var(--ink-2);
+  max-width: 100%;
+}
+.filechip code { color: var(--ink); overflow-wrap: anywhere; }
+
+.card {
+  position: relative;
+  margin-top: 22px;
+  padding: 26px 28px 24px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+  animation: rise .5s cubic-bezier(.2,.7,.2,1) both;
+  animation-delay: calc(var(--i, 0) * 55ms + 80ms);
+}
+@keyframes rise { from { opacity: 0; transform: translateY(10px); } }
+.q > header { display: flex; align-items: baseline; gap: 14px; margin-bottom: 6px; }
+.qnum {
+  font: 700 13px/1 var(--font-mono); color: var(--accent);
+  padding: 5px 7px; border: 1px solid var(--line-strong); border-radius: 6px;
+  flex: none; transform: translateY(-3px);
+}
+.q h2 { margin: 0; font: 700 25px/1.15 var(--font-display); letter-spacing: .005em; }
+.q .sintro { margin: 4px 0 0; color: var(--ink-2); max-width: 64ch; }
+.q[data-state="done"] .qnum { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); }
+
+.field { margin-top: 20px; }
+.field + .field { border-top: 1px dashed var(--line); padding-top: 20px; }
+.field.dim { opacity: .5; }
+.label { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin: 0 0 8px; font-weight: 600; font-size: 15.5px; }
+.req {
+  font: 600 10.5px/1 var(--font-mono); letter-spacing: .08em; text-transform: uppercase;
+  color: var(--amber); padding: 4px 6px; border-radius: 5px; background: var(--amber-soft);
+}
+.input, .affix {
+  width: 100%;
+  background: var(--field);
+  border: 1.5px solid var(--line-strong);
+  border-radius: 10px;
+  color: var(--ink);
+  transition: border-color .15s, box-shadow .15s;
+}
+.input { padding: 11px 13px; font: 16px/1.3 var(--font-body); }
+.input.mono { font-family: var(--font-mono); font-size: 14.5px; }
+.input::placeholder { color: var(--ink-3); opacity: .8; }
+.input:focus, .affix:focus-within { outline: none; border-color: var(--accent); box-shadow: 0 0 0 4px var(--accent-soft); }
+.affix { display: flex; align-items: center; max-width: 260px; }
+.affix .input { border: 0; background: transparent; box-shadow: none !important; min-width: 0; }
+.affix span { padding: 0 12px; color: var(--ink-3); font: 600 15px/1 var(--font-mono); }
+.affix span:first-child { padding-right: 0; }
+.field.has-error .input, .field.has-error .affix { border-color: var(--red); }
+.help { margin: 8px 0 0; font-size: 14px; color: var(--ink-2); max-width: 70ch; }
+.help a { white-space: nowrap; }
+.err {
+  margin: 10px 0 0; padding: 9px 12px;
+  border-radius: 9px; background: var(--red-soft); color: var(--red);
+  font-size: 14px; border-left: 3px solid var(--red);
+}
+.writes {
+  display: flex; gap: 10px; align-items: baseline;
+  margin: 10px 0 0; font: 12.5px/1.4 var(--font-mono); color: var(--ink-3);
+}
+.writes span { flex: none; padding: 2px 6px; border: 1px solid var(--line); border-radius: 5px; font-size: 10.5px; letter-spacing: .06em; text-transform: uppercase; }
+.writes code { font-size: 12.5px; color: var(--ink-2); overflow-wrap: anywhere; }
+
+.chips { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; align-items: center; }
+.chips small { color: var(--ink-3); font-size: 12.5px; margin-right: 2px; }
+.chip {
+  padding: 6px 11px; border-radius: 999px;
+  border: 1px solid var(--line-strong); background: var(--panel-2);
+  font: 500 13px/1.2 var(--font-mono); cursor: pointer; color: var(--ink);
+  transition: border-color .15s, background .15s;
+}
+.chip:hover { border-color: var(--accent); }
+.chip[aria-pressed="true"] { background: var(--accent-soft); border-color: var(--accent); color: var(--accent); }
+.chip em { font-style: normal; color: var(--ink-3); font-family: var(--font-body); font-size: 11.5px; margin-left: 4px; }
+
+.choices { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; border: 0; padding: 0; margin: 0; }
+.choices legend { padding: 0; }
+.choice {
+  position: relative; display: block; cursor: pointer;
+  padding: 15px 16px 14px 46px;
+  border: 1.5px solid var(--line-strong); border-radius: 12px; background: var(--field);
+  transition: border-color .15s, background .15s;
+}
+.choice:hover { border-color: var(--ink-3); }
+.choice input { position: absolute; left: 16px; top: 17px; width: 18px; height: 18px; accent-color: var(--accent); margin: 0; }
+.choice b { display: block; font-size: 15.5px; }
+.choice small { display: block; margin-top: 3px; color: var(--ink-2); font-size: 13.5px; line-height: 1.45; }
+.choice:has(input:checked) { border-color: var(--accent); background: var(--accent-soft); }
+.choice:has(input:focus-visible) { box-shadow: 0 0 0 4px var(--accent-soft); }
+
+.switch { display: inline-flex; align-items: center; gap: 12px; cursor: pointer; font-weight: 600; font-size: 15.5px; }
+.switch input { appearance: none; margin: 0; flex: none; width: 46px; height: 26px; border-radius: 999px; background: var(--line-strong); position: relative; cursor: pointer; transition: background .2s; }
+.switch input::after { content: ""; position: absolute; top: 3px; left: 3px; width: 20px; height: 20px; border-radius: 50%; background: var(--ink); transition: transform .2s cubic-bezier(.3,.7,.3,1.3); }
+.switch input:checked { background: var(--accent); }
+.switch input:checked::after { transform: translateX(20px); background: var(--accent-ink); }
+
+.presets { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
+.hourhint { margin-left: 12px; font-size: 13.5px; color: var(--ink-2); }
+.hourrow { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; }
+
+/* AWS helper */
+.aws { border-style: dashed; background: color-mix(in srgb, var(--panel) 75%, transparent); }
+.aws .row { display: flex; align-items: center; justify-content: space-between; gap: 18px; flex-wrap: wrap; }
+.aws h2 { margin: 0; font: 700 19px/1.2 var(--font-display); }
+.aws p { margin: 6px 0 0; color: var(--ink-2); font-size: 14.5px; max-width: 60ch; }
+.tag { font: 600 10.5px/1 var(--font-mono); letter-spacing: .1em; text-transform: uppercase; color: var(--ink-3); border: 1px solid var(--line); padding: 4px 6px; border-radius: 5px; margin-left: 8px; vertical-align: 3px; }
+.btn {
+  display: inline-flex; align-items: center; gap: 8px;
+  padding: 10px 15px; border-radius: 10px;
+  border: 1.5px solid var(--line-strong); background: var(--panel-2);
+  font-weight: 600; font-size: 14.5px; cursor: pointer; white-space: nowrap;
+  transition: border-color .15s, transform .12s;
+}
+.btn:hover { border-color: var(--accent); }
+.btn:active { transform: translateY(1px); }
+.btn[disabled] { opacity: .6; cursor: progress; }
+.btn.small { padding: 7px 11px; font-size: 13.5px; }
+.awsresult { margin-top: 16px; }
+.facts { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 6px 16px; margin: 0; font-size: 14px; }
+.facts dt { color: var(--ink-3); }
+.facts dd { margin: 0; font-family: var(--font-mono); font-size: 13.5px; overflow-wrap: anywhere; }
+.notice { margin-top: 12px; padding: 10px 13px; border-radius: 10px; font-size: 14px; }
+.notice.warn { background: var(--amber-soft); color: var(--amber); border-left: 3px solid var(--amber); }
+.notice.bad { background: var(--red-soft); color: var(--red); border-left: 3px solid var(--red); }
+.notice.tip { margin-top: 18px; background: var(--panel-2); color: var(--ink-2); border-left: 3px solid var(--line-strong); }
+.notice.tip b { color: var(--ink); }
+.notice.tip p { margin: 6px 0 0; }
+.notice code { color: var(--ink); }
+.lead { margin: 16px 0 0; font-weight: 600; font-size: 14.5px; }
+.signins { display: grid; gap: 10px; margin-top: 12px; }
+.signins .choice { padding: 12px 14px 12px 44px; }
+.signins .choice input { top: 14px; }
+.signins .acct { font-family: var(--font-mono); font-size: 13px; color: var(--ink-2); margin-left: 8px; }
+.signedout { margin-top: 14px; }
+.signedout summary { cursor: pointer; color: var(--ink-2); font-size: 14px; }
+.signedout .out { margin-top: 12px; }
+.signedout .out b { font: 600 13.5px/1.3 var(--font-mono); }
+.signedout .out span { color: var(--ink-3); font-size: 13px; margin-left: 8px; }
+.muted { color: var(--ink-3); font-size: 14px; margin: 14px 0 0; }
+.suggest { margin-top: 12px; display: flex; gap: 10px; align-items: center; flex-wrap: wrap; font-size: 13.5px; color: var(--ink-2); }
+
+/* advanced */
+.advanced { margin-top: 22px; }
+.advanced > summary {
+  list-style: none; cursor: pointer;
+  display: flex; align-items: center; gap: 14px;
+  padding: 18px 22px; border: 1px solid var(--line); border-radius: var(--radius);
+  background: var(--panel); box-shadow: var(--shadow);
+}
+.advanced > summary::-webkit-details-marker { display: none; }
+.advanced > summary b { font: 700 19px/1.2 var(--font-display); }
+.advanced > summary small { color: var(--ink-3); font-size: 14px; }
+.advanced > summary::after { content: "+"; margin-left: auto; font: 400 26px/1 var(--font-mono); color: var(--accent); transition: transform .2s; }
+.advanced[open] > summary::after { transform: rotate(45deg); }
+.advanced .card { margin-top: 14px; animation: none; }
+.advanced .q h2 { font-size: 20px; }
+
+/* next steps */
+.next h2 { margin: 0 0 4px; font: 700 25px/1.15 var(--font-display); }
+.next > p { margin: 0 0 16px; color: var(--ink-2); }
+.next[data-ready="true"] { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent), var(--shadow); }
+.steps { list-style: none; margin: 0; padding: 0; counter-reset: step; }
+.steps li { counter-increment: step; display: grid; grid-template-columns: 34px minmax(0, 1fr); gap: 4px 12px; padding: 14px 0; border-top: 1px dashed var(--line); }
+.steps li::before {
+  content: counter(step);
+  grid-row: span 2;
+  width: 28px; height: 28px; border-radius: 50%;
+  display: grid; place-items: center;
+  border: 1.5px solid var(--line-strong);
+  font: 700 13px/1 var(--font-mono); color: var(--accent);
+}
+.steps b { font-size: 15.5px; }
+.steps p { margin: 0; color: var(--ink-2); font-size: 14px; }
+.cmd {
+  display: flex; align-items: center; gap: 10px; justify-content: space-between;
+  margin-top: 8px; padding: 9px 9px 9px 14px;
+  background: var(--field); border: 1px solid var(--line-strong); border-radius: 10px;
+  font: 14px/1.3 var(--font-mono);
+}
+.cmd code { font-size: 14px; overflow-wrap: anywhere; }
+.cmd code::before { content: "$ "; color: var(--ink-3); }
+.extras { margin-top: 10px; font-size: 13px; color: var(--ink-3); }
+
+.fatal { max-width: 640px; margin: 15vh auto; padding: 0 24px; text-align: center; }
+.fatal h1 { font-size: 32px; }
+.fatal p { color: var(--ink-2); }
+
+.sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+
+@media (max-width: 920px) {
+  .shell { grid-template-columns: minmax(0, 1fr); gap: 8px; padding: 20px 16px 120px; }
+  /* backdrop-filter would make the fixed save bar position inside the panel */
+  .panel { position: static; backdrop-filter: none; display: grid; grid-template-columns: auto 1fr; gap: 0 18px; align-items: center; }
+  .brand { grid-column: 1 / -1; }
+  .radar { --size: 120px; margin: 16px 4px; }
+  .checklist { margin: 0; }
+  .checklist a { padding: 4px 6px; font-size: 13.5px; }
+  .savebox {
+    position: fixed; left: 0; right: 0; bottom: 0; z-index: 10;
+    padding: 12px 16px calc(12px + env(safe-area-inset-bottom));
+    background: color-mix(in srgb, var(--panel) 94%, transparent);
+    backdrop-filter: blur(10px);
+    border-top: 1px solid var(--line);
+    display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 12px; align-items: center;
+  }
+  .savebox .btn-primary { width: auto; padding: 12px 18px; }
+  .btn-primary kbd { display: none; }
+  .status { margin: 0; font-size: 13px; }
+  .status .detail { display: none; }
+  .card { padding: 20px 18px; }
+  .q h2 { font-size: 21px; }
+}
+@media (max-width: 520px) {
+  /* Phones: the bottom save bar carries the status; skip the progress map. */
+  .panel { display: block; padding: 14px 16px; }
+  .radar, .checklist { display: none; }
+}
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation: none !important; transition: none !important; }
+  html { scroll-behavior: auto; }
+}
+</style>
+</head>
+<body>
+<div class="shell" id="app" hidden>
+  <aside class="panel" aria-label="Progress">
+    <div class="brand"><b>Budget Radar</b><span>PREFLIGHT</span></div>
+    <div class="radar" id="radar" aria-hidden="true">
+      <div class="ring"></div><div class="ring"></div>
+      <div class="axis h"></div><div class="axis v"></div>
+      <div class="sweep"></div>
+    </div>
+    <ol class="checklist" id="checklist"></ol>
+    <div class="savebox">
+      <button class="btn-primary" id="save" type="button">Save <span class="fname">.env</span> <kbd id="savekbd">Ctrl S</kbd></button>
+      <div class="status" id="status" role="status" aria-live="polite"></div>
+    </div>
+  </aside>
+
+  <main>
+    <header class="intro">
+      <p class="eyebrow">Setup · runs only on this computer</p>
+      <h1>Set up your AWS safety net.</h1>
+      <p class="lede">Answer the questions below, then click <b>Save</b>. This page writes your <code>.env</code> file, the one file Budget Radar reads. Nothing gets deployed from here.</p>
+      <p class="filechip" id="filechip"></p>
+    </header>
+
+    <section class="card aws" id="aws" style="--i:0" aria-labelledby="aws-title">
+      <div class="row">
+        <div>
+          <h2 id="aws-title">Let AWS fill in the hard parts <span class="tag">Optional</span></h2>
+          <p>Finds the AWS accounts you're signed in to on this computer, then looks up your IAM users and admin identity (read-only, free) so you can click instead of typing ARNs.</p>
+        </div>
+        <button class="btn" id="checkaws" type="button">Check again</button>
+      </div>
+      <div id="signins" aria-live="polite"></div>
+      <div class="awsresult" id="awsresult" aria-live="polite"></div>
+    </section>
+
+    <form id="form" novalidate></form>
+
+    <section class="card next" id="next" style="--i:9" aria-labelledby="next-title">
+      <h2 id="next-title">After you save: deploy it</h2>
+      <p>Run these in a terminal, in this project folder. A second terminal is fine, or stop this page first with <code>Ctrl+C</code>.</p>
+      <ol class="steps">
+        <li id="profilestep" hidden></li>
+        <li><b>Prepare your account for CDK (once per account and region)</b><div><div class="cmd"><code>npx cdk bootstrap</code></div></div></li>
+        <li><b>Deploy</b><div><p>Runs the safety checks first and stops with a clear message if anything is off.</p><div class="cmd"><code>npm run deploy</code></div></div></li>
+        <li><b>Confirm your email</b><p id="confirmstep">AWS sends a "Subscription Confirmation" email. Click the link in it, or no alerts arrive.</p></li>
+        <li><b>Check that the email is confirmed</b><div><p>Use the ReportTopicArn printed at the end of the deploy.</p><div class="cmd"><code>npm run verify -- &lt;ReportTopicArn&gt;</code></div></div></li>
+      </ol>
+      <div class="notice tip" id="deployhelp"></div>
+    </section>
+  </main>
+</div>
+
+<div class="fatal" id="fatal" hidden>
+  <h1>Can't reach the setup server</h1>
+  <p>This page is served by <code>npm run dev</code>. Start it again in your terminal, then reload.</p>
+</div>
+
+<script>
+"use strict";
+
+const S = {
+  sections: [], fields: [], byKey: {}, values: {},
+  touched: new Set(), savedOnce: false, dirty: false,
+  validation: null, whoami: null, docsUrl: null, envFile: null, extras: [],
+  validateSeq: 0, validateTimer: null
+};
+
+// ---------- tiny DOM helper (text only, never innerHTML) ----------
+function h(tag, props, ...kids) {
+  const el = document.createElement(tag);
+  for (const [k, v] of Object.entries(props || {})) {
+    if (v == null || v === false) continue;
+    if (k === "class") el.className = v;
+    else if (k === "text") el.textContent = v;
+    else if (k.startsWith("on")) el.addEventListener(k.slice(2), v);
+    else el.setAttribute(k, v === true ? "" : v);
+  }
+  return addKids(el, kids);
+}
+// Arrays flatten; null/undefined/false are skipped (so `cond && h(...)` works).
+function addKids(el, kids) {
+  for (const kid of kids.flat(Infinity)) if (kid != null && kid !== false) el.append(kid);
+  return el;
+}
+// Use instead of replaceChildren, which would print arrays and `undefined` as text.
+function fill(el, ...kids) {
+  el.replaceChildren();
+  return addKids(el, kids);
+}
+const $ = (id) => document.getElementById(id);
+
+async function api(path, body) {
+  let res;
+  try {
+    res = await fetch(path, body === undefined ? {} : {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body)
+    });
+  } catch {
+    throw new Error("Can't reach the setup server. Is npm run dev still running?");
+  }
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error || `Request failed (${res.status})`);
+  return data;
+}
+
+function learnMore(doc) {
+  if (!doc || !S.docsUrl || !/^https:\/\//.test(S.docsUrl)) return null;
+  return h("a", { href: S.docsUrl + doc, target: "_blank", rel: "noopener noreferrer" }, "Learn more ↗");
+}
+
+// ---------- rendering ----------
+function render() {
+  const form = $("form");
+  const main = S.sections.filter(s => !s.advanced);
+  const adv = S.sections.filter(s => s.advanced);
+
+  main.forEach((s, i) => form.append(sectionCard(s, String(i + 1).padStart(2, "0"), i + 1)));
+  const details = h("details", { class: "advanced", id: "advanced" },
+    h("summary", {}, h("b", { text: "Advanced settings" }), h("small", { text: "Optional. The defaults are sensible." })),
+    adv.map((s, i) => sectionCard(s, null, 0))
+  );
+  form.append(details);
+
+  const list = $("checklist");
+  main.forEach((s, i) => list.append(h("li", { "data-section": s.id },
+    h("a", { href: `#sec-${s.id}` }, h("span", { class: "dot" }), h("span", { class: "num", text: String(i + 1).padStart(2, "0") }), s.short))));
+
+  const radar = $("radar");
+  main.forEach((s, i) => {
+    const angle = Math.round(i * (360 / main.length) + 25);
+    const dist = i % 2 ? "34px" : "58px";
+    radar.append(h("span", { class: "blip", "data-section": s.id, style: `--a:${angle}deg;--d:${dist}` }));
+  });
+
+  if (S.extras.length) {
+    $("filechip").after(h("p", { class: "extras", text: `Also in your .env and kept as-is: ${S.extras.join(", ")}` }));
+  }
+
+  $("savekbd").textContent = /Mac|iPhone|iPad/.test(navigator.platform) ? "⌘S" : "Ctrl S";
+}
+
+function sectionCard(section, num, i) {
+  const fields = S.fields.filter(f => f.section === section.id);
+  return h("section", { class: "card q", id: `sec-${section.id}`, style: `--i:${i}`, "aria-labelledby": `t-${section.id}` },
+    h("header", {}, num && h("span", { class: "qnum", text: num }), h("h2", { id: `t-${section.id}`, text: section.title })),
+    section.intro && h("p", { class: "sintro", text: section.intro }),
+    fields.map(fieldBlock)
+  );
+}
+
+function fieldBlock(f) {
+  const isGroup = f.type === "choice";
+  const label = isGroup ? null : f.type === "toggle" ? null :
+    h("label", { class: "label", for: `f-${f.key}` }, f.label, f.required && h("span", { class: "req", text: "Required" }));
+  return h("div", { class: "field", id: `fld-${f.key}`, "data-key": f.key },
+    label,
+    control(f),
+    h("p", { class: "help", id: `h-${f.key}` }, f.help, " ", learnMore(f.docs)),
+    h("p", { class: "err", id: `e-${f.key}`, hidden: true }),
+    h("p", { class: "writes" }, h("span", { text: ".env" }), h("code", { id: `w-${f.key}` }))
+  );
+}
+
+function inputProps(f, extra) {
+  return Object.assign({
+    id: `f-${f.key}`, name: f.key, value: S.values[f.key] ?? "",
+    "aria-describedby": `h-${f.key} e-${f.key}`, autocomplete: "off",
+    spellcheck: "false", autocapitalize: "off",
+    placeholder: f.placeholder || null,
+    oninput: (e) => setValue(f.key, e.target.value),
+    onblur: () => { S.touched.add(f.key); paint(); }
+  }, extra);
+}
+
+function control(f) {
+  const v = S.values[f.key] ?? "";
+  switch (f.type) {
+    case "choice":
+      return h("fieldset", { class: "choices", "aria-describedby": `h-${f.key} e-${f.key}` },
+        h("legend", { class: "label" }, f.label),
+        f.options.map(o => h("label", { class: "choice" },
+          h("input", {
+            type: "radio", name: f.key, value: o.value, checked: v === o.value,
+            onchange: () => { S.touched.add(f.key); setValue(f.key, o.value); }
+          }),
+          h("b", { text: o.label }), h("small", { text: o.help })
+        ))
+      );
+    case "toggle": {
+      const on = v.toLowerCase() === "true";
+      return h("label", { class: "switch" },
+        h("input", {
+          type: "checkbox", role: "switch", id: `f-${f.key}`, checked: on,
+          "aria-describedby": `h-${f.key} e-${f.key}`,
+          onchange: (e) => { S.touched.add(f.key); setValue(f.key, e.target.checked ? "true" : "false"); }
+        }),
+        f.label
+      );
+    }
+    case "money":
+      return h("div", {},
+        h("div", { class: "affix" }, h("span", { text: "$" }), h("input", inputProps(f, { class: "input", inputmode: "decimal" }))),
+        f.presets && h("div", { class: "presets" }, f.presets.map(p => h("button", {
+          type: "button", class: "chip", "data-preset": p,
+          onclick: () => { S.touched.add(f.key); setValue(f.key, p, true); }
+        }, `$${p}`, p === "0.01" && h("em", { text: "first-cent tripwire" })))));
+    case "percent":
+      return h("div", { class: "affix", style: "max-width:160px" }, h("input", inputProps(f, { class: "input", inputmode: "numeric" })), h("span", { text: "%" }));
+    case "hour":
+      return h("div", { class: "hourrow" },
+        h("div", { class: "affix", style: "max-width:160px" }, h("input", inputProps(f, { class: "input", inputmode: "numeric" })), h("span", { text: "UTC" })),
+        h("span", { class: "hourhint", id: `hh-${f.key}` }));
+    case "email":
+      return h("input", inputProps(f, { class: "input", type: "email", autocomplete: "email" }));
+    case "arn":
+      return h("div", {},
+        h("input", inputProps(f, { class: "input mono" })),
+        h("div", { class: "suggest", id: `s-${f.key}`, hidden: true }));
+    case "list":
+      return h("div", {},
+        h("input", inputProps(f, { class: "input mono" })),
+        h("div", { class: "chips", id: `s-${f.key}`, hidden: true }));
+    default:
+      return h("input", inputProps(f, { class: "input" }));
+  }
+}
+
+// ---------- state changes ----------
+function setValue(key, value, syncInput) {
+  S.values[key] = value;
+  S.dirty = true;
+  if (syncInput) {
+    const el = $(`f-${key}`);
+    if (el && el.type !== "checkbox") el.value = value;
+  }
+  scheduleValidate();
+  paint();
+}
+
+function scheduleValidate() {
+  clearTimeout(S.validateTimer);
+  S.validateTimer = setTimeout(async () => {
+    const seq = ++S.validateSeq;
+    try {
+      const v = await api("/api/validate", { values: S.values });
+      if (seq === S.validateSeq) { S.validation = v; paint(); }
+    } catch (e) {
+      if (seq === S.validateSeq) setStatus("bad", "Can't check your answers", { text: e.message });
+    }
+  }, 280);
+}
+
+async function save() {
+  const btn = $("save");
+  btn.disabled = true;
+  clearTimeout(S.validateTimer);
+  S.validateSeq++;
+  try {
+    const r = await api("/api/save", { values: S.values });
+    S.dirty = false;
+    S.savedOnce = true;
+    S.validation = r.validation;
+    S.envFile = r.envFile;
+    paint();
+    if (r.validation.ok) {
+      const radar = $("radar");
+      radar.classList.remove("ping"); void radar.offsetWidth; radar.classList.add("ping");
+    }
+  } catch (e) {
+    setStatus("bad", "Not saved", { text: e.message });
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+// ---------- painting ----------
+function sectionState(id) {
+  const v = S.validation;
+  const fields = S.fields.filter(f => f.section === id);
+  if (v && !v.ok && fields.some(f => f.key === v.field)) {
+    return (S.savedOnce || S.touched.has(v.field)) ? "error" : "todo";
+  }
+  return fields.every(f => !f.required || (S.values[f.key] || "").trim()) ? "done" : "todo";
+}
+
+function paint() {
+  for (const f of S.fields) {
+    const v = S.values[f.key] ?? "";
+    $(`w-${f.key}`).textContent = `${f.key}=${v}`;
+
+    const showErr = S.validation && !S.validation.ok && S.validation.field === f.key && (S.touched.has(f.key) || S.savedOnce);
+    const err = $(`e-${f.key}`);
+    err.hidden = !showErr;
+    err.textContent = showErr ? S.validation.error : "";
+    $(`fld-${f.key}`).classList.toggle("has-error", !!showErr);
+
+    if (f.dependsOn) $(`fld-${f.key}`).classList.toggle("dim", (S.values[f.dependsOn] || "").toLowerCase() !== "true");
+    if (f.type === "hour") $(`hh-${f.key}`).textContent = localHour(v);
+    if (f.presets) document.querySelectorAll(`#fld-${f.key} [data-preset]`).forEach(b => b.setAttribute("aria-pressed", String(b.dataset.preset === v.trim())));
+  }
+
+  for (const s of S.sections) {
+    const st = sectionState(s.id);
+    document.querySelectorAll(`[data-section="${s.id}"]`).forEach(el => el.dataset.state = st);
+    $(`sec-${s.id}`).dataset.state = st;
+  }
+
+  fill($("filechip"), S.envFile.exists ? "Editing" : "No .env yet. Save creates", " ", h("code", { text: S.envFile.path }));
+
+  const email = (S.values.ALERT_EMAIL || "").trim();
+  $("confirmstep").textContent = `AWS sends a "Subscription Confirmation" email to ${email || "your alert address"}. Click the link in it, or no alerts arrive.`;
+  $("next").dataset.ready = String(!S.dirty && !!S.validation?.ok);
+  paintProfileStep();
+  paintDeployHelp();
+
+  paintStatus();
+  paintSuggestions();
+}
+
+function paintStatus() {
+  const v = S.validation || { ok: false };
+  const todo = v.ok ? null : { lead: "Next up:", text: v.error, target: v.field };
+  if (S.dirty) {
+    return setStatus("warn", "Unsaved changes", todo || { text: "Everything checks out. Save to write .env." });
+  }
+  if (!S.savedOnce) {
+    return v.ok
+      ? setStatus("ok", "Your .env is ready to deploy", { text: "Deploy steps are at the bottom.", target: "next" })
+      : setStatus("warn", "Let's fill in your .env", todo);
+  }
+  return v.ok
+    ? setStatus("ok", "Saved. Ready to deploy", { text: "Deploy steps are at the bottom.", target: "next" })
+    : setStatus("bad", "Saved, but not ready to deploy yet", { ...todo, lead: "Fix:" });
+}
+
+// Network/save errors and the readiness summary share this one slot.
+function setStatus(tone, head, detail) {
+  const el = $("status");
+  el.dataset.tone = tone;
+  const target = detail?.target;
+  fill(el,
+    h("div", { class: "head" }, h("span", { class: "light" }), head),
+    detail?.text && h("p", { class: "detail" },
+      detail.lead && h("b", { text: detail.lead + " " }), detail.text, " ",
+      target && h("button", {
+        type: "button", class: "linkish", text: "Show me",
+        onclick: () => (S.byKey[target] ? goToField(target) : $(target).scrollIntoView())
+      }))
+  );
+}
+
+function goToField(key) {
+  const f = S.byKey[key];
+  if (!f) return;
+  const sec = S.sections.find(s => s.id === f.section);
+  if (sec?.advanced) $("advanced").open = true;
+  S.touched.add(key);
+  paint();
+  const fld = $(`fld-${key}`);
+  fld.scrollIntoView({ block: "center" });
+  (fld.querySelector("input") || fld).focus({ preventScroll: true });
+}
+
+function localHour(v) {
+  const n = Number(v);
+  if (v.trim() === "" || !Number.isInteger(n) || n < 0 || n > 23) return "";
+  const d = new Date();
+  d.setUTCHours(n, 0, 0, 0);
+  return `= ${d.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })} your time today`;
+}
+
+function copyButton(text) {
+  return h("button", {
+    type: "button", class: "btn small",
+    onclick: async (e) => {
+      const b = e.currentTarget;
+      try { await navigator.clipboard.writeText(text); b.textContent = "Copied"; }
+      catch { b.textContent = "Select & copy"; }
+      setTimeout(() => (b.textContent = "Copy"), 1400);
+    }
+  }, "Copy");
+}
+const cmdBox = (text) => h("div", { class: "cmd" }, h("code", { text }), copyButton(text));
+
+// ---------- AWS helper ----------
+// Finds which AWS CLI profiles are signed in right now, then loads details
+// for the chosen one. Choice order: what the student already picked, the
+// profile their shell selects (AWS_PROFILE), or the only signed-in account.
+// Signed in to several accounts? They pick; guessing could protect the
+// wrong account.
+async function loadSignIns() {
+  const btn = $("checkaws");
+  btn.disabled = true;
+  btn.textContent = "Looking…";
+  fill($("signins"), h("p", { class: "muted", text: "Looking for AWS sign-ins on this computer…" }));
+  try {
+    S.signins = await api("/api/aws/signins");
+  } catch (e) {
+    S.signins = { error: e.message, signIns: [] };
+  }
+  btn.disabled = false;
+  btn.textContent = "Check again";
+
+  const ins = S.signins.signIns.filter(s => s.signedIn);
+  const has = (p) => p && ins.some(s => s.profile === p);
+  const pick = has(S.awsProfile) ? S.awsProfile
+    : has(S.signins.active) ? S.signins.active
+    : new Set(ins.map(s => s.account)).size === 1 ? ins[0].profile
+    : null;
+  if (pick) return selectProfile(pick);
+  S.awsProfile = null;
+  S.whoami = null;
+  paintSignIns(); paintAws(); paint();
+}
+
+async function selectProfile(profile) {
+  S.awsProfile = profile;
+  S.whoami = null;
+  paintSignIns();
+  fill($("awsresult"), h("p", { class: "muted", text: `Looking up details for ${profile}…` }));
+  try {
+    S.whoami = await api(`/api/aws/whoami?profile=${encodeURIComponent(profile)}`);
+  } catch (e) {
+    S.whoami = { ok: false, error: e.message, profile };
+  }
+  if (S.awsProfile !== profile) return; // picked another meanwhile
+  paintAws(); paint();
+}
+
+const loginCommand = (s) => {
+  const flag = s.profile === "default" ? "" : ` --profile ${s.profile}`;
+  return s.sso ? `aws sso login${flag}` : `aws configure${flag}`;
+};
+
+function describeArn(arn) {
+  const sso = arn.match(/assumed-role\/AWSReservedSSO_(.+?)_[0-9a-f]{16}\/(.+)$/);
+  if (sso) return `${sso[1]} (SSO) as ${sso[2]}`;
+  const role = arn.match(/assumed-role\/([^/]+)\/(.+)$/);
+  if (role) return `role ${role[1]} as ${role[2]}`;
+  if (/:root$/.test(arn)) return "root user";
+  return arn.split(":").pop();
+}
+
+function paintSignIns() {
+  const box = $("signins"), d = S.signins;
+  if (!d) return;
+  if (d.error) return fill(box, h("div", { class: "notice warn", text: d.error }));
+  if (!d.signIns.length) {
+    return fill(box,
+      h("div", { class: "notice warn", text: "No AWS CLI profiles on this computer yet. Set one up in a terminal (SSO or access keys), then click Check again. You can also fill everything in by hand." }),
+      cmdBox("aws configure sso"), cmdBox("aws configure"));
+  }
+  const ins = d.signIns.filter(s => s.signedIn), outs = d.signIns.filter(s => !s.signedIn);
+  const accounts = new Set(ins.map(s => s.account)).size;
+  fill(box,
+    ins.length
+      ? h("p", { class: "lead", text: accounts > 1
+          ? `You're signed in to ${accounts} AWS accounts. Pick the one Budget Radar should protect:`
+          : "Signed in on this computer:" })
+      : h("div", { class: "notice warn", text: "None of your AWS profiles is signed in right now. Sign in with a command below, then click Check again." }),
+    ins.length > 0 && h("div", { class: "signins", role: "radiogroup", "aria-label": "AWS profile" }, ins.map(s => h("label", { class: "choice" },
+      h("input", { type: "radio", name: "awsprofile", value: s.profile, checked: s.profile === S.awsProfile, onchange: () => selectProfile(s.profile) }),
+      h("b", {}, s.profile, h("span", { class: "acct", text: `account ${s.account}` })),
+      h("small", { text: describeArn(s.arn) })))),
+    outs.length > 0 && h("details", { class: "signedout", open: !ins.length },
+      h("summary", { text: `${outs.length} profile${outs.length > 1 ? "s" : ""} not signed in` }),
+      outs.map(s => h("div", { class: "out" },
+        h("b", { text: s.profile }), h("span", { text: [s.account && `account ${s.account}`, s.reason].filter(Boolean).join(" · ") }),
+        cmdBox(loginCommand(s)))))
+  );
+}
+
+function paintAws() {
+  const w = S.whoami, out = $("awsresult");
+  if (!w) return fill(out);
+  if (!w.ok) return fill(out, h("div", { class: "notice warn", text: `${w.profile}: ${w.error}` }));
+  fill(out,
+    h("dl", { class: "facts" },
+      h("dt", { text: "Profile" }), h("dd", { text: w.profile }),
+      h("dt", { text: "Account" }), h("dd", { text: w.account }),
+      h("dt", { text: "Signed in as" }), h("dd", { text: w.arn }),
+      w.region && h("dt", { text: "Region" }), w.region && h("dd", { text: `${w.region}  (where Radar will be deployed)` })),
+    w.note && h("div", { class: "notice warn", text: w.note }),
+    w.usersError && h("div", { class: "notice warn", text: w.usersError }),
+    h("p", { text: "Suggestions now appear under the blocked-user and recovery-admin questions." })
+  );
+}
+
+const exportProfile = (p) => /Win/.test(navigator.platform)
+  ? `$env:AWS_PROFILE = "${p}"`
+  : `export AWS_PROFILE=${/^[\w.@-]+$/.test(p) ? p : `'${p}'`}`;
+
+// The most common deploy failure: the terminal uses a different AWS profile
+// than the one the student signed in with (or its sign-in expired since).
+// Always shown; filled in with the picked profile when we know it.
+function paintDeployHelp() {
+  const p = S.awsProfile || "your-profile-name";
+  const sso = S.signins?.signIns?.find(s => s.profile === S.awsProfile)?.sso ?? true;
+  fill($("deployhelp"),
+    h("b", { text: "Deploy says \"Token is expired\" or \"Could not load credentials\"?" }),
+    h("p", { text: "That terminal is using a different AWS profile than the one you signed in with, or the sign-in ran out (SSO sign-ins last several hours). In the terminal you deploy from, sign in, select the profile, then run npm run deploy again:" }),
+    cmdBox(sso ? `aws sso login --profile ${p}` : `aws configure --profile ${p}`),
+    cmdBox(exportProfile(p)),
+    !S.awsProfile && h("p", {}, "Not sure of your profile's name? ", h("code", { text: "aws configure list-profiles" }), " lists them.")
+  );
+}
+
+// `npm run deploy` (and cdk) only use a named profile if the terminal it
+// runs in selects it, so the deploy steps say how.
+function paintProfileStep() {
+  const li = $("profilestep"), p = S.awsProfile;
+  li.hidden = !p || p === "default";
+  if (li.hidden) return fill(li);
+  fill(li,
+    h("b", { text: `Use the ${p} profile in that terminal` }),
+    h("div", {}, h("p", { text: "Deploys only use this AWS account if the terminal you run them from selects it. Run this first, in the same terminal:" }),
+      cmdBox(exportProfile(p))));
+}
+
+function signedInUser() {
+  const w = S.whoami;
+  return w?.ok && w.kind === "user" ? w.arn.split("/").pop() : null;
+}
+
+function paintSuggestions() {
+  const w = S.whoami;
+  const users = $("s-IAM_DENY_TARGET_USERS");
+  if (users) {
+    const current = (S.values.IAM_DENY_TARGET_USERS || "").split(",").map(s => s.trim()).filter(Boolean);
+    const names = w?.ok ? w.users : [];
+    users.hidden = names.length === 0;
+    fill(users,
+      h("small", { text: "Your IAM users:" }),
+      names.map(n => h("button", {
+        type: "button", class: "chip", "aria-pressed": String(current.includes(n)),
+        onclick: () => {
+          const next = current.includes(n) ? current.filter(x => x !== n) : [...current, n];
+          S.touched.add("IAM_DENY_TARGET_USERS");
+          setValue("IAM_DENY_TARGET_USERS", next.join(","), true);
+        }
+      }, n, n === signedInUser() && h("em", { text: "signed in now" })))
+    );
+  }
+
+  const rec = $("s-RECOVERY_PRINCIPAL_ARN");
+  if (rec) {
+    const arn = w?.ok ? w.recoveryArn : null;
+    rec.hidden = !arn;
+    if (!arn) return fill(rec);
+    const using = (S.values.RECOVERY_PRINCIPAL_ARN || "").trim() === arn;
+    fill(rec,
+      h("button", {
+        type: "button", class: "btn small", disabled: using,
+        onclick: () => { S.touched.add("RECOVERY_PRINCIPAL_ARN"); setValue("RECOVERY_PRINCIPAL_ARN", arn, true); }
+      }, using ? "✓ Using the identity you're signed in as" : "Use the identity I'm signed in as"),
+      h("span", { text: "Only if that's your admin, not the user you're blocking." })
+    );
+  }
+}
+
+// ---------- boot ----------
+(async function boot() {
+  let st;
+  try {
+    st = await api("/api/state");
+  } catch {
+    $("fatal").hidden = false;
+    return;
+  }
+  Object.assign(S, {
+    sections: st.sections, fields: st.fields, docsUrl: st.docsUrl,
+    envFile: st.envFile, extras: st.extras, validation: st.validation
+  });
+  for (const f of st.fields) {
+    S.byKey[f.key] = f;
+    // A blank toggle means its default; show (and later save) it explicitly.
+    S.values[f.key] = f.type === "toggle" && !f.value.trim() ? f.templateValue : f.value;
+  }
+  render();
+  paint();
+  $("app").hidden = false;
+
+  $("form").addEventListener("submit", (e) => { e.preventDefault(); save(); });
+  $("save").addEventListener("click", save);
+  $("checkaws").addEventListener("click", loadSignIns);
+  document.querySelectorAll(".cmd:not(:has(button))").forEach(c => c.append(copyButton(c.querySelector("code").textContent)));
+  document.addEventListener("keydown", (e) => {
+    if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "s") { e.preventDefault(); save(); }
+  });
+  window.addEventListener("beforeunload", (e) => { if (S.dirty) { e.preventDefault(); e.returnValue = ""; } });
+  loadSignIns();
+})();
+</script>
+</body>
+</html>
